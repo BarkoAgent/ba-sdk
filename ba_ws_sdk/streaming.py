@@ -4,7 +4,7 @@ import threading
 import time
 import logging
 import os
-from typing import Optional
+from typing import Dict, Optional
 import numpy as np
 import cv2
 import asyncio
@@ -17,6 +17,7 @@ RECORDING_GC_INTERVAL = int(os.getenv("RECORDING_GC_INTERVAL", "30"))
 
 # Globals
 _STREAM_THREADS = {}       # run_id -> Thread
+_STREAM_TASKS: Dict[str, asyncio.Task] = {}            # run_id -> asyncio.Task
 _STREAM_FLAGS = {}         # run_id -> threading.Event (stop flag)
 _LATEST_FRAMES = {}        # run_id -> (jpeg_bytes, timestamp)
 _RECORDING_FLAGS = set()   # set of run_ids currently recording
@@ -460,14 +461,14 @@ async def astart_stream(
     If an existing task is found and is still running, returns without starting a new one.
     """
     async with _LOCK:
-        existing = _STREAM_THREADS.get(run_id)
+        existing = _STREAM_TASKS.get(run_id)
         if existing and not existing.done():
             logging.info(f"Stream already running for run_id={run_id}; start_stream no-op.")
             return
 
         logging.info(f"Starting stream task for run_id={run_id} fps={fps} quality={jpeg_quality}")
         task = asyncio.create_task(_astream_worker(run_id, driver, fps, jpeg_quality, stop_after), name=f"stream-{run_id}")
-        _STREAM_THREADS[run_id] = task
+        _STREAM_TASKS[run_id] = task
 
         # optional: attach done callback to clean up dicts when task finishes
         def _on_done(t: asyncio.Task, rid=run_id):
@@ -475,7 +476,7 @@ async def astart_stream(
             # schedule cleanup in loop
             async def _cleanup():
                 async with _LOCK:
-                    _STREAM_THREADS.pop(rid, None)
+                    _STREAM_TASKS.pop(rid, None)
                     _LATEST_FRAMES.pop(rid, None)
             try:
                 asyncio.create_task(_cleanup())
@@ -495,20 +496,20 @@ async def astop_stream(run_id: str, cancel_timeout: float = 2.0) -> None:
     Attempts graceful cancellation and waits up to `cancel_timeout` seconds.
     """
     async with _LOCK:
-        task = _STREAM_THREADS.get(run_id)
+        task = _STREAM_TASKS.get(run_id)
 
     if not task:
         logging.info(f"No active stream task for run_id={run_id}")
         # ensure any leftover frames removed
         async with _LOCK:
             _LATEST_FRAMES.pop(run_id, None)
-            _STREAM_THREADS.pop(run_id, None)
+            _STREAM_TASKS.pop(run_id, None)
         return
 
     if task.done():
         logging.info(f"Stream task already done for run_id={run_id}")
         async with _LOCK:
-            _STREAM_THREADS.pop(run_id, None)
+            _STREAM_TASKS.pop(run_id, None)
             _LATEST_FRAMES.pop(run_id, None)
         return
 
@@ -522,6 +523,6 @@ async def astop_stream(run_id: str, cancel_timeout: float = 2.0) -> None:
         logging.exception(f"Exception while stopping task for run_id={run_id}")
     finally:
         async with _LOCK:
-            _STREAM_THREADS.pop(run_id, None)
+            _STREAM_TASKS.pop(run_id, None)
             _LATEST_FRAMES.pop(run_id, None)
         logging.info(f"Stopped stream for run_id={run_id}")
