@@ -26,6 +26,7 @@ _SEQ_COUNTERS = {}         # run_id -> next seq number
 _ACKED_UP_TO = {}          # run_id -> last acked seq (-1 means none acked)
 _LAST_FRAME_AT = {}        # run_id -> timestamp of last frame capture
 _LOCK = threading.Lock()
+_ASYNC_LOCK = asyncio.Lock()
 _GC_STARTED = False
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -426,12 +427,12 @@ async def _astream_worker(
                 jpeg_bytes = png_bytes
 
             # store latest frame (use lock if concurrent access expected)
-            if _LOCK.locked():
+            if _ASYNC_LOCK.locked():
                 # unlikely but keep defensive pattern (acquire re-entrantly not possible),
                 # so we do a simple try / finally with acquire to be consistent
                 pass
 
-            async with _LOCK:
+            async with _ASYNC_LOCK:
                 _LATEST_FRAMES[run_id] = (jpeg_bytes, time.time())
 
             # sleep for interval (cooperative; allows cancellation)
@@ -460,7 +461,7 @@ async def astart_stream(
     Start an async streaming task for `run_id`. No-op if already running.
     If an existing task is found and is still running, returns without starting a new one.
     """
-    async with _LOCK:
+    async with _ASYNC_LOCK:
         existing = _STREAM_TASKS.get(run_id)
         if existing and not existing.done():
             logging.info(f"Stream already running for run_id={run_id}; start_stream no-op.")
@@ -475,7 +476,7 @@ async def astart_stream(
             logging.info(f"Stream task done for run_id={rid}. Cleaning up.")
             # schedule cleanup in loop
             async def _cleanup():
-                async with _LOCK:
+                async with _ASYNC_LOCK:
                     _STREAM_TASKS.pop(rid, None)
                     _LATEST_FRAMES.pop(rid, None)
             try:
@@ -495,20 +496,20 @@ async def astop_stream(run_id: str, cancel_timeout: float = 2.0) -> None:
     Stop the stream task for `run_id` and cleanup.
     Attempts graceful cancellation and waits up to `cancel_timeout` seconds.
     """
-    async with _LOCK:
+    async with _ASYNC_LOCK:
         task = _STREAM_TASKS.get(run_id)
 
     if not task:
         logging.info(f"No active stream task for run_id={run_id}")
         # ensure any leftover frames removed
-        async with _LOCK:
+        async with _ASYNC_LOCK:
             _LATEST_FRAMES.pop(run_id, None)
             _STREAM_TASKS.pop(run_id, None)
         return
 
     if task.done():
         logging.info(f"Stream task already done for run_id={run_id}")
-        async with _LOCK:
+        async with _ASYNC_LOCK:
             _STREAM_TASKS.pop(run_id, None)
             _LATEST_FRAMES.pop(run_id, None)
         return
@@ -522,7 +523,7 @@ async def astop_stream(run_id: str, cancel_timeout: float = 2.0) -> None:
     except Exception:
         logging.exception(f"Exception while stopping task for run_id={run_id}")
     finally:
-        async with _LOCK:
+        async with _ASYNC_LOCK:
             _STREAM_TASKS.pop(run_id, None)
             _LATEST_FRAMES.pop(run_id, None)
         logging.info(f"Stopped stream for run_id={run_id}")
