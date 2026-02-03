@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ba_sdk"
+version = "0.0.1"
+authors = [
+  { name = "Álvaro Santos Laserna López", email = "alvaro.laserna@testdevlab.com" }
+]
+description = "BA SDK: SDK for building Barko Agents with WebSocket communication."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+]
+dependencies = [
+  "websockets>=10.3",
+  "async-timeout>=4.0.2",
+  "python-dotenv>=0.21.0",
+]
+
+[project.urls]
+Homepage = "https://barkoagent.com"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+quote-style = "double"
