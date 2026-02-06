@@ -287,25 +287,25 @@ def _start_gc_once():
 
 _start_gc_once()
 
-def _start_frame_recording(_run_test_id='1') -> str:
+async def _start_frame_recording(_run_test_id='1') -> str:
     """
     [SYSTEM] Starts persisting (recording) frames for the given run_id.
     Not exposed to users - called by backend only.
     """
-    start_recording(_run_test_id)
+    await asyncio.to_thread(start_recording, _run_test_id)
     return "recording started"
 
 
-def _stop_frame_recording(_run_test_id='1') -> str:
+async def _stop_frame_recording(_run_test_id='1') -> str:
     """
     [SYSTEM] Stops persisting (recording) frames for the given run_id.
     Not exposed to users - called by backend only.
     """
-    stop_recording(_run_test_id)
+    await asyncio.to_thread(stop_recording, _run_test_id)
     return "recording stopped"
 
 
-def _get_recorded_frames(_run_test_id='1', since_seq: int = 0, limit: int = 50):
+async def _get_recorded_frames(_run_test_id='1', since_seq: int = 0, limit: int = 50):
     """
     [SYSTEM] Retrieves persisted frames with cursor-based pagination.
     Not exposed to users - called by backend only.
@@ -332,7 +332,7 @@ def _get_recorded_frames(_run_test_id='1', since_seq: int = 0, limit: int = 50):
         since_seq = 0
         limit = 50
 
-    frames = get_recorded_frames(_run_test_id, since_seq=since_seq, limit=limit)
+    frames = await asyncio.to_thread(get_recorded_frames, _run_test_id, since_seq, limit)
     
     result = []
     for frame in frames:
@@ -346,7 +346,7 @@ def _get_recorded_frames(_run_test_id='1', since_seq: int = 0, limit: int = 50):
     return result
 
 
-def _ack_recorded_frames(_run_test_id='1', up_to_seq: int = 0) -> str:
+async def _ack_recorded_frames(_run_test_id='1', up_to_seq: int = 0) -> str:
     """
     [SYSTEM] Acknowledge frames up to and including up_to_seq.
     ACK'd frames are freed from memory and will not be returned in future calls.
@@ -364,16 +364,16 @@ def _ack_recorded_frames(_run_test_id='1', up_to_seq: int = 0) -> str:
     except (ValueError, TypeError):
         up_to_seq = 0
 
-    ack_recorded_frames(_run_test_id, up_to_seq=up_to_seq)
+    await asyncio.to_thread(ack_recorded_frames, _run_test_id, up_to_seq)
     return "frames acknowledged"
 
 
-def _clear_frame_recording(_run_test_id='1') -> str:
+async def _clear_frame_recording(_run_test_id='1') -> str:
     """
     [SYSTEM] Clears all persisted frames and resets seq counter for the given run_id.
     Not exposed to users - called by backend only.
     """
-    clear_recorded_frames(_run_test_id)
+    await asyncio.to_thread(clear_recorded_frames, _run_test_id)
     return "recording cleared"
 
 
@@ -426,14 +426,30 @@ async def _astream_worker(
                 logging.exception(f"[{run_id}] PNG->JPEG conversion failed; storing PNG as fallback")
                 jpeg_bytes = png_bytes
 
-            # store latest frame (use lock if concurrent access expected)
-            if _ASYNC_LOCK.locked():
-                # unlikely but keep defensive pattern (acquire re-entrantly not possible),
-                # so we do a simple try / finally with acquire to be consistent
-                pass
-
-            async with _ASYNC_LOCK:
+            # store latest frame and record if enabled
+            with _LOCK:
                 _LATEST_FRAMES[run_id] = (jpeg_bytes, time.time())
+                
+                # Store frames under ALL active recording IDs with seq numbers
+                for rec_id in list(_RECORDING_FLAGS):
+                    # Hard limit: max frames per recording
+                    if len(_RECORDED_FRAMES.get(rec_id, [])) >= MAX_FRAMES_PER_RECORDING:
+                        logging.warning(f"[LIMIT] Recording {rec_id} exceeded MAX_FRAMES_PER_RECORDING ({MAX_FRAMES_PER_RECORDING}). Auto-stopping.")
+                        _RECORDING_FLAGS.discard(rec_id)
+                        continue
+                    
+                    if rec_id not in _RECORDED_FRAMES:
+                        _RECORDED_FRAMES[rec_id] = []
+                        _SEQ_COUNTERS[rec_id] = 0
+                    
+                    seq = _SEQ_COUNTERS[rec_id]
+                    _RECORDED_FRAMES[rec_id].append({
+                        "seq": seq,
+                        "timestamp": time.time(),
+                        "data": jpeg_bytes
+                    })
+                    _SEQ_COUNTERS[rec_id] = seq + 1
+                    _LAST_FRAME_AT[rec_id] = time.time()
 
             # sleep for interval (cooperative; allows cancellation)
             try:
@@ -461,55 +477,42 @@ async def astart_stream(
     Start an async streaming task for `run_id`. No-op if already running.
     If an existing task is found and is still running, returns without starting a new one.
     """
-    async with _ASYNC_LOCK:
-        existing = _STREAM_TASKS.get(run_id)
-        if existing and not existing.done():
-            logging.info(f"Stream already running for run_id={run_id}; start_stream no-op.")
-            return
+    existing = _STREAM_TASKS.get(run_id)
+    if existing and not existing.done():
+        logging.info(f"Stream already running for run_id={run_id}; start_stream no-op.")
+        return
 
-        logging.info(f"Starting stream task for run_id={run_id} fps={fps} quality={jpeg_quality}")
-        task = asyncio.create_task(_astream_worker(run_id, driver, fps, jpeg_quality, stop_after), name=f"stream-{run_id}")
-        _STREAM_TASKS[run_id] = task
+    logging.info(f"Starting stream task for run_id={run_id} fps={fps} quality={jpeg_quality}")
+    task = asyncio.create_task(_astream_worker(run_id, driver, fps, jpeg_quality, stop_after), name=f"stream-{run_id}")
+    _STREAM_TASKS[run_id] = task
 
-        # optional: attach done callback to clean up dicts when task finishes
-        def _on_done(t: asyncio.Task, rid=run_id):
-            logging.info(f"Stream task done for run_id={rid}. Cleaning up.")
-            # schedule cleanup in loop
-            async def _cleanup():
-                async with _ASYNC_LOCK:
-                    _STREAM_TASKS.pop(rid, None)
-                    _LATEST_FRAMES.pop(rid, None)
-            try:
-                asyncio.create_task(_cleanup())
-            except Exception:
-                # fallback synchronous cleanup (best effort)
-                try:
-                    # this is safe: we are in callback executed in loop
-                    asyncio.get_event_loop().create_task(_cleanup())
-                except Exception:
-                    logging.exception("Failed to schedule cleanup task")
+    # optional: attach done callback to clean up dicts when task finishes
+    def _on_done(t: asyncio.Task, rid=run_id):
+        logging.info(f"Stream task done for run_id={rid}. Cleaning up.")
+        with _LOCK:
+            _STREAM_TASKS.pop(rid, None)
+            _LATEST_FRAMES.pop(rid, None)
 
-        task.add_done_callback(_on_done)
+    task.add_done_callback(_on_done)
 
 async def astop_stream(run_id: str, cancel_timeout: float = 2.0) -> None:
     """
     Stop the stream task for `run_id` and cleanup.
     Attempts graceful cancellation and waits up to `cancel_timeout` seconds.
     """
-    async with _ASYNC_LOCK:
-        task = _STREAM_TASKS.get(run_id)
+    task = _STREAM_TASKS.get(run_id)
 
     if not task:
         logging.info(f"No active stream task for run_id={run_id}")
         # ensure any leftover frames removed
-        async with _ASYNC_LOCK:
+        with _LOCK:
             _LATEST_FRAMES.pop(run_id, None)
             _STREAM_TASKS.pop(run_id, None)
         return
 
     if task.done():
         logging.info(f"Stream task already done for run_id={run_id}")
-        async with _ASYNC_LOCK:
+        with _LOCK:
             _STREAM_TASKS.pop(run_id, None)
             _LATEST_FRAMES.pop(run_id, None)
         return
@@ -523,7 +526,7 @@ async def astop_stream(run_id: str, cancel_timeout: float = 2.0) -> None:
     except Exception:
         logging.exception(f"Exception while stopping task for run_id={run_id}")
     finally:
-        async with _ASYNC_LOCK:
+        with _LOCK:
             _STREAM_TASKS.pop(run_id, None)
             _LATEST_FRAMES.pop(run_id, None)
         logging.info(f"Stopped stream for run_id={run_id}")
