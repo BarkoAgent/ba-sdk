@@ -25,12 +25,72 @@ _RECORDED_FRAMES = {}      # run_id -> list of {seq, timestamp, data (bytes)}
 _SEQ_COUNTERS = {}         # run_id -> next seq number
 _ACKED_UP_TO = {}          # run_id -> last acked seq (-1 means none acked)
 _LAST_FRAME_AT = {}        # run_id -> timestamp of last frame capture
+_CAPTURE_DRIVERS = {}      # run_id -> driver reference (for per-step capture)
 _LOCK = threading.Lock()
 _ASYNC_LOCK = asyncio.Lock()
 _GC_STARTED = False
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logging.getLogger("urllib3").setLevel(logging.ERROR)
+
+
+def register_driver(run_id: str, driver) -> None:
+    """Register a driver so capture_step_frame can take screenshots from it."""
+    with _LOCK:
+        _CAPTURE_DRIVERS[run_id] = driver
+    logging.info(f"Registered driver for capture: run_id={run_id}")
+
+
+def unregister_driver(run_id: str) -> None:
+    """Unregister a driver when it's being stopped."""
+    with _LOCK:
+        _CAPTURE_DRIVERS.pop(run_id, None)
+    logging.info(f"Unregistered driver for capture: run_id={run_id}")
+
+
+def capture_step_frame(step_index: int = None, func_name: str = None) -> None:
+    """
+    Take a fresh screenshot from any registered driver and append it
+    to ALL active recordings in _RECORDING_FLAGS.
+    Called by execute_macro_bulk after each step.
+    """
+    with _LOCK:
+        if not _RECORDING_FLAGS:
+            return  # No active recordings, nothing to do
+        if not _CAPTURE_DRIVERS:
+            return  # No driver registered yet
+        # Grab the first available driver
+        run_id, driver = next(iter(_CAPTURE_DRIVERS.items()))
+
+    # Capture outside the lock (screenshot is slow)
+    try:
+        png_bytes = driver.get_driver().get_screenshot_as_png()
+        jpeg_bytes = _png_to_jpeg_bytes(png_bytes)
+    except Exception as e:
+        logging.warning(f"[StepCapture] Failed to capture frame for step {step_index} ({func_name}): {e}")
+        return
+
+    # Append to all active recordings
+    with _LOCK:
+        now = time.time()
+        for rec_id in list(_RECORDING_FLAGS):
+            if len(_RECORDED_FRAMES.get(rec_id, [])) >= MAX_FRAMES_PER_RECORDING:
+                logging.warning(f"[StepCapture] Frame cap reached for {rec_id}. Skipping.")
+                continue
+            if rec_id not in _RECORDED_FRAMES:
+                _RECORDED_FRAMES[rec_id] = []
+                _SEQ_COUNTERS[rec_id] = 0
+            seq = _SEQ_COUNTERS[rec_id]
+            _RECORDED_FRAMES[rec_id].append({
+                "seq": seq,
+                "timestamp": now,
+                "data": jpeg_bytes,
+                "trigger": "step",
+                "step_index": step_index,
+                "func_name": func_name
+            })
+            _SEQ_COUNTERS[rec_id] = seq + 1
+            _LAST_FRAME_AT[rec_id] = now
 
 
 def _png_to_jpeg_bytes(png_bytes: bytes, quality: int = 80) -> bytes:
@@ -340,7 +400,10 @@ async def _get_recorded_frames(_run_test_id='1', since_seq: int = 0, limit: int 
         result.append({
             'seq': frame["seq"],
             'timestamp': frame["timestamp"],
-            'data': b64_str
+            'data': b64_str,
+            'trigger': frame.get("trigger", "timer"),
+            'step_index': frame.get("step_index"),
+            'func_name': frame.get("func_name")
         })
     
     return result

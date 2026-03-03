@@ -108,10 +108,97 @@ async def stream_frames_multiplex(ws, run_id, get_latest_frame, interval=1.0):
             logging.exception("[Manager] Error in multiplex stream")
             break
 
+
 async def call_maybe_blocking(func, *args, **kwargs):
     if asyncio.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
+
+async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "1") -> dict:
+    executed_lines = 0
+    results = []
+    driver_created_for = None
+
+    try:
+        for i, command in enumerate(commands):
+            func_name = command.get("function")
+            args = command.get("args", []) or []
+            kwargs = command.get("kwargs", {}) or {}
+
+            if func_name == "create_driver":
+                driver_created_for = kwargs.get("_run_test_id", run_id)
+            if func_name == "stop_driver":
+                driver_created_for = None
+
+            if func_name not in FUNCTION_MAP:
+                error_msg = f"Unknown function: {func_name}"
+                results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "error", "output": error_msg})
+                return {
+                    "status": "error",
+                    "executed_lines": executed_lines,
+                    "failed_index": i,
+                    "failed_function": func_name,
+                    "error_details": error_msg,
+                    "message": f"Macro halted at index {i} due to error.",
+                    "results": results
+                }
+
+            try:
+                result = await call_maybe_blocking(FUNCTION_MAP[func_name], *args, **kwargs)
+                if isinstance(result, dict) and result.get("status") == "error":
+                    error_msg = result.get("error", "Unknown error from function")
+                    results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "error", "output": error_msg})
+                    return {
+                        "status": "error",
+                        "executed_lines": executed_lines,
+                        "failed_index": i,
+                        "failed_function": func_name,
+                        "error_details": error_msg,
+                        "message": f"Macro halted at index {i} due to error.",
+                        "results": results
+                    }
+                output = result if isinstance(result, str) else str(result)
+                results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "success", "output": output})
+            except Exception as e:
+                logging.error(f"[BulkExec] Step {i} ({func_name}) failed: {e}")
+                error_msg = str(e)
+                results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "error", "output": error_msg})
+                return {
+                    "status": "error",
+                    "executed_lines": executed_lines,
+                    "failed_index": i,
+                    "failed_function": func_name,
+                    "error_details": error_msg,
+                    "message": f"Macro halted at index {i} due to error.",
+                    "results": results
+                }
+
+            executed_lines += 1
+
+            # Capture a persistent frame after each step (skip stop_driver since browser is dead)
+            if func_name != "stop_driver":
+                try:
+                    streaming.capture_step_frame(step_index=i, func_name=func_name)
+                except Exception:
+                    pass  # Non-fatal: recording is best-effort
+
+        return {
+            "status": "success",
+            "executed_lines": executed_lines,
+            "failed_index": None,
+            "error_details": None,
+            "message": f"Successfully executed {executed_lines} commands sequentially.",
+            "results": results
+        }
+    finally:
+        if driver_created_for:
+            logging.info(f"[BulkExec] Auto-cleanup: stop_driver({driver_created_for}) due to macro failure.")
+            try:
+                stop_fn = FUNCTION_MAP.get("stop_driver")
+                if stop_fn:
+                    await call_maybe_blocking(stop_fn, _run_test_id=driver_created_for)
+            except Exception as e:
+                logging.error(f"[BulkExec] Auto-cleanup failed: {e}")
 
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     response_dict = {}
@@ -140,6 +227,13 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
                 "methods": method_details,
                 "system_methods": system_methods
             })
+            return json.dumps(response_dict)
+
+        if function_name == "execute_macro_bulk":
+            commands = args[0] if args else kwargs.get("commands", [])
+            _run_test_id = kwargs.get("_run_test_id", "1")
+            result = await execute_macro_bulk(commands, FUNCTION_MAP, run_id=_run_test_id)
+            response_dict.update(result)
             return json.dumps(response_dict)
 
         if function_name in SYSTEM_FUNCTIONS:
