@@ -48,19 +48,53 @@ def unregister_driver(run_id: str) -> None:
     logging.info(f"Unregistered driver for capture: run_id={run_id}")
 
 
-def capture_step_frame(step_index: int = None, func_name: str = None) -> None:
+def _append_recorded_frame_locked(
+    run_id: str,
+    jpeg_bytes: bytes,
+    trigger: str = "timer",
+    step_index: int = None,
+    func_name: str = None,
+) -> None:
+    if run_id not in _RECORDING_FLAGS:
+        return
+    if len(_RECORDED_FRAMES.get(run_id, [])) >= MAX_FRAMES_PER_RECORDING:
+        logging.warning(
+            f"[LIMIT] Recording {run_id} exceeded MAX_FRAMES_PER_RECORDING ({MAX_FRAMES_PER_RECORDING}). Auto-stopping."
+        )
+        _RECORDING_FLAGS.discard(run_id)
+        return
+    if run_id not in _RECORDED_FRAMES:
+        _RECORDED_FRAMES[run_id] = []
+    if run_id not in _SEQ_COUNTERS:
+        _SEQ_COUNTERS[run_id] = 0
+    now = time.time()
+    seq = _SEQ_COUNTERS[run_id]
+    _RECORDED_FRAMES[run_id].append(
+        {
+            "seq": seq,
+            "timestamp": now,
+            "data": jpeg_bytes,
+            "trigger": trigger,
+            "step_index": step_index,
+            "func_name": func_name,
+        }
+    )
+    _SEQ_COUNTERS[run_id] = seq + 1
+    _LAST_FRAME_AT[run_id] = now
+
+
+def capture_step_frame(run_id: str, step_index: int = None, func_name: str = None) -> None:
     """
-    Take a fresh screenshot from any registered driver and append it
-    to ALL active recordings in _RECORDING_FLAGS.
+    Take a fresh screenshot from the run-owned driver and append it
+    only to that run's recording bucket.
     Called by execute_macro_bulk after each step.
     """
     with _LOCK:
-        if not _RECORDING_FLAGS:
-            return  # No active recordings, nothing to do
-        if not _CAPTURE_DRIVERS:
-            return  # No driver registered yet
-        # Grab the first available driver
-        run_id, driver = next(iter(_CAPTURE_DRIVERS.items()))
+        if run_id not in _RECORDING_FLAGS:
+            return
+        driver = _CAPTURE_DRIVERS.get(run_id)
+        if driver is None:
+            return
 
     # Capture outside the lock (screenshot is slow)
     try:
@@ -70,27 +104,15 @@ def capture_step_frame(step_index: int = None, func_name: str = None) -> None:
         logging.warning(f"[StepCapture] Failed to capture frame for step {step_index} ({func_name}): {e}")
         return
 
-    # Append to all active recordings
+    # Append to this run only
     with _LOCK:
-        now = time.time()
-        for rec_id in list(_RECORDING_FLAGS):
-            if len(_RECORDED_FRAMES.get(rec_id, [])) >= MAX_FRAMES_PER_RECORDING:
-                logging.warning(f"[StepCapture] Frame cap reached for {rec_id}. Skipping.")
-                continue
-            if rec_id not in _RECORDED_FRAMES:
-                _RECORDED_FRAMES[rec_id] = []
-                _SEQ_COUNTERS[rec_id] = 0
-            seq = _SEQ_COUNTERS[rec_id]
-            _RECORDED_FRAMES[rec_id].append({
-                "seq": seq,
-                "timestamp": now,
-                "data": jpeg_bytes,
-                "trigger": "step",
-                "step_index": step_index,
-                "func_name": func_name
-            })
-            _SEQ_COUNTERS[rec_id] = seq + 1
-            _LAST_FRAME_AT[rec_id] = now
+        _append_recorded_frame_locked(
+            run_id=run_id,
+            jpeg_bytes=jpeg_bytes,
+            trigger="step",
+            step_index=step_index,
+            func_name=func_name,
+        )
 
 
 def _png_to_jpeg_bytes(png_bytes: bytes, quality: int = 80) -> bytes:
@@ -132,27 +154,7 @@ def _stream_worker(run_id: str, driver, fps: float, jpeg_quality: int, stop_even
 
             with _LOCK:
                 _LATEST_FRAMES[run_id] = (jpeg_bytes, time.time())
-                
-                # Store frames under ALL active recording IDs with seq numbers
-                for rec_id in list(_RECORDING_FLAGS):
-                    # Hard limit: max frames per recording
-                    if len(_RECORDED_FRAMES.get(rec_id, [])) >= MAX_FRAMES_PER_RECORDING:
-                        logging.warning(f"[LIMIT] Recording {rec_id} exceeded MAX_FRAMES_PER_RECORDING ({MAX_FRAMES_PER_RECORDING}). Auto-stopping.")
-                        _RECORDING_FLAGS.discard(rec_id)
-                        continue
-                    
-                    if rec_id not in _RECORDED_FRAMES:
-                        _RECORDED_FRAMES[rec_id] = []
-                        _SEQ_COUNTERS[rec_id] = 0
-                    
-                    seq = _SEQ_COUNTERS[rec_id]
-                    _RECORDED_FRAMES[rec_id].append({
-                        "seq": seq,
-                        "timestamp": time.time(),
-                        "data": jpeg_bytes
-                    })
-                    _SEQ_COUNTERS[rec_id] = seq + 1
-                    _LAST_FRAME_AT[rec_id] = time.time()
+                _append_recorded_frame_locked(run_id=run_id, jpeg_bytes=jpeg_bytes, trigger="timer")
 
             stop_event.wait(interval)
     except Exception:
@@ -230,6 +232,13 @@ def get_latest_frame(run_id: str) -> Optional[bytes]:
         if item is None:
             return None
         return item[0]
+
+
+def get_active_capture_run_ids():
+    """Return run_ids that currently own capture state or latest frames."""
+    with _LOCK:
+        run_ids = set(_CAPTURE_DRIVERS.keys()) | set(_LATEST_FRAMES.keys()) | set(_RECORDING_FLAGS)
+    return list(run_ids)
 
 
 # -------------------------------------------------------------------------
@@ -495,27 +504,7 @@ async def _astream_worker(
             # store latest frame and record if enabled
             with _LOCK:
                 _LATEST_FRAMES[run_id] = (jpeg_bytes, time.time())
-                
-                # Store frames under ALL active recording IDs with seq numbers
-                for rec_id in list(_RECORDING_FLAGS):
-                    # Hard limit: max frames per recording
-                    if len(_RECORDED_FRAMES.get(rec_id, [])) >= MAX_FRAMES_PER_RECORDING:
-                        logging.warning(f"[LIMIT] Recording {rec_id} exceeded MAX_FRAMES_PER_RECORDING ({MAX_FRAMES_PER_RECORDING}). Auto-stopping.")
-                        _RECORDING_FLAGS.discard(rec_id)
-                        continue
-                    
-                    if rec_id not in _RECORDED_FRAMES:
-                        _RECORDED_FRAMES[rec_id] = []
-                        _SEQ_COUNTERS[rec_id] = 0
-                    
-                    seq = _SEQ_COUNTERS[rec_id]
-                    _RECORDED_FRAMES[rec_id].append({
-                        "seq": seq,
-                        "timestamp": time.time(),
-                        "data": jpeg_bytes
-                    })
-                    _SEQ_COUNTERS[rec_id] = seq + 1
-                    _LAST_FRAME_AT[rec_id] = time.time()
+                _append_recorded_frame_locked(run_id=run_id, jpeg_bytes=jpeg_bytes, trigger="timer")
 
             # sleep for interval (cooperative; allows cancellation)
             try:
