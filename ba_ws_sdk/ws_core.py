@@ -288,13 +288,7 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
             "message": f"Successfully executed {executed_lines} commands sequentially.",
             "results": results
         }
-    finally:
-        if driver_created_for:
-            stop_fn = FUNCTION_MAP.get("stop_driver")
-            for created_run_id in sorted(driver_created_for):
-                logging.info(
-                    f"[BulkExec] Auto-cleanup: stop_driver({created_run_id}) due to macro failure."
-                )
+    
 
 
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
