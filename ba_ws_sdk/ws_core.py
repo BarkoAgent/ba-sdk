@@ -288,8 +288,24 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
             "message": f"Successfully executed {executed_lines} commands sequentially.",
             "results": results
         }
+    except Exception as e:
+        logging.error(f"[BulkExec] Fatal error in macro execution: {e}")
+        return {
+            "status": "error",
+            "executed_lines": executed_lines,
+            "failed_index": None,
+            "failed_function": None,
+            "error_details": str(e),
+            "message": "Macro execution failed due to an unexpected error.",
+            "results": results
+        }
+    finally:
+        if driver_created_for:
+            for created_run_id in sorted(driver_created_for):
+                logging.info(
+                    f"[BulkExec] macro failure for ({created_run_id}) ."
+                )
     
-
 
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     response_dict = {}
