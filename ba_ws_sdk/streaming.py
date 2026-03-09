@@ -4,7 +4,8 @@ import threading
 import time
 import logging
 import os
-from typing import Dict, Optional
+import inspect
+from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import cv2
 import asyncio
@@ -14,6 +15,8 @@ RECORDING_TTL_SECONDS = int(os.getenv("RECORDING_TTL_SECONDS", "300"))
 MAX_ACTIVE_RECORDINGS = int(os.getenv("MAX_ACTIVE_RECORDINGS", "3"))
 MAX_FRAMES_PER_RECORDING = int(os.getenv("MAX_FRAMES_PER_RECORDING", "1000"))
 RECORDING_GC_INTERVAL = int(os.getenv("RECORDING_GC_INTERVAL", "30"))
+ENABLE_ELEMENT_BBOX = os.getenv("ENABLE_ELEMENT_BBOX", "true").lower() in ("1", "true", "yes")
+STEP_CAPTURE_JPEG_QUALITY = int(os.getenv("STEP_CAPTURE_JPEG_QUALITY", "80"))
 
 # Globals
 _STREAM_THREADS = {}       # run_id -> Thread
@@ -27,7 +30,6 @@ _ACKED_UP_TO = {}          # run_id -> last acked seq (-1 means none acked)
 _LAST_FRAME_AT = {}        # run_id -> timestamp of last frame capture
 _CAPTURE_DRIVERS = {}      # run_id -> driver reference (for per-step capture)
 _LOCK = threading.Lock()
-_ASYNC_LOCK = asyncio.Lock()
 _GC_STARTED = False
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -83,28 +85,370 @@ def _append_recorded_frame_locked(
     _LAST_FRAME_AT[run_id] = now
 
 
-def capture_step_frame(run_id: str, step_index: int = None, func_name: str = None) -> None:
+def _append_recorded_timer_frame_for_linked_runs_locked(source_run_id: str, jpeg_bytes: bytes) -> None:
     """
-    Take a fresh screenshot from the run-owned driver and append it
-    only to that run's recording bucket.
-    Called by execute_macro_bulk after each step.
+    Append timer frames to all run_ids that share the same driver object.
+    This keeps recording working when callers start recording with a different
+    run_id than the one used to start the stream.
     """
-    with _LOCK:
-        if run_id not in _RECORDING_FLAGS:
-            return
-        driver = _CAPTURE_DRIVERS.get(run_id)
-        if driver is None:
-            return
+    _append_recorded_frame_locked(run_id=source_run_id, jpeg_bytes=jpeg_bytes, trigger="timer")
 
-    # Capture outside the lock (screenshot is slow)
-    try:
-        png_bytes = driver.get_driver().get_screenshot_as_png()
-        jpeg_bytes = _png_to_jpeg_bytes(png_bytes)
-    except Exception as e:
-        logging.warning(f"[StepCapture] Failed to capture frame for step {step_index} ({func_name}): {e}")
+    source_driver = _CAPTURE_DRIVERS.get(source_run_id)
+    if source_driver is None:
         return
 
-    # Append to this run only
+    for run_id, driver in _CAPTURE_DRIVERS.items():
+        if run_id == source_run_id:
+            continue
+        if driver is not source_driver:
+            continue
+        _append_recorded_frame_locked(run_id=run_id, jpeg_bytes=jpeg_bytes, trigger="timer")
+
+
+def _decode_image_bytes(image_bytes: bytes):
+    nparr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image bytes")
+    return img
+
+
+def _normalized_bbox(raw_bbox: Any) -> Optional[dict]:
+    if not isinstance(raw_bbox, dict):
+        return None
+    if not all(k in raw_bbox for k in ("x", "y", "width", "height")):
+        return None
+    try:
+        x = float(raw_bbox["x"])
+        y = float(raw_bbox["y"])
+        width = float(raw_bbox["width"])
+        height = float(raw_bbox["height"])
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _bbox_from_payload(payload: Any) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("bounding_box"), dict):
+        return _normalized_bbox(payload["bounding_box"])
+    return _normalized_bbox(payload)
+
+
+def _draw_bbox(img, bbox: dict, scale: float = 1.0, label: Optional[str] = None) -> None:
+    if scale <= 0:
+        scale = 1.0
+    height, width = img.shape[:2]
+
+    x1 = int(round(bbox["x"] * scale))
+    y1 = int(round(bbox["y"] * scale))
+    x2 = int(round((bbox["x"] + bbox["width"]) * scale))
+    y2 = int(round((bbox["y"] + bbox["height"]) * scale))
+
+    x1 = max(0, min(x1, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    x2 = max(0, min(x2, width - 1))
+    y2 = max(0, min(y2, height - 1))
+
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    color = (0, 255, 0)
+    thickness = max(2, int(min(width, height) * 0.003))
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+    if label:
+        text_origin = (x1, max(15, y1 - 8))
+        cv2.putText(img, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+
+def _image_to_jpeg_bytes(
+    image_bytes: bytes,
+    quality: int = 80,
+    bbox: Optional[dict] = None,
+    bbox_scale: float = 1.0,
+    label: Optional[str] = None,
+) -> bytes:
+    img = _decode_image_bytes(image_bytes)
+    if bbox:
+        _draw_bbox(img, bbox, scale=bbox_scale, label=label)
+    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        raise RuntimeError("Failed to encode JPEG")
+    return enc.tobytes()
+
+
+def _png_to_jpeg_bytes(png_bytes: bytes, quality: int = 80) -> bytes:
+    """
+    Convert PNG bytes (Selenium's get_screenshot_as_png) to JPEG bytes.
+    """
+    return _image_to_jpeg_bytes(png_bytes, quality=quality)
+
+
+def _get_selenium_driver(driver):
+    if driver is None:
+        return None
+    if isinstance(driver, dict):
+        raw_driver = driver.get("driver")
+        if raw_driver is not None and hasattr(raw_driver, "get_screenshot_as_png"):
+            return raw_driver
+        return None
+    if hasattr(driver, "get_screenshot_as_png"):
+        return driver
+    if hasattr(driver, "get_driver") and callable(driver.get_driver):
+        try:
+            raw_driver = driver.get_driver()
+        except Exception as exc:
+            logging.debug(f"Failed to unwrap Selenium driver: {exc}")
+            return None
+        if raw_driver is not None and hasattr(raw_driver, "get_screenshot_as_png"):
+            return raw_driver
+    return None
+
+
+def _get_playwright_page(driver):
+    if driver is None:
+        return None
+    page = None
+    if isinstance(driver, dict):
+        page = driver.get("page")
+    elif hasattr(driver, "page"):
+        page = getattr(driver, "page")
+        if callable(page):
+            try:
+                page = page()
+            except Exception:
+                page = None
+    elif hasattr(driver, "get_page") and callable(driver.get_page):
+        try:
+            page = driver.get_page()
+        except Exception:
+            page = None
+    if page is not None and hasattr(page, "screenshot"):
+        return page
+    return None
+
+
+def _extract_locator(element_hint: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(element_hint, dict):
+        return None, None
+    locator_type = element_hint.get("locator_type") or element_hint.get("by")
+    locator = element_hint.get("locator") or element_hint.get("selector") or element_hint.get("value")
+    if locator is None:
+        return (str(locator_type).strip().lower() if locator_type else None), None
+    locator_value = str(locator).strip()
+    if not locator_value:
+        return (str(locator_type).strip().lower() if locator_type else None), None
+    return (str(locator_type).strip().lower() if locator_type else None), locator_value
+
+
+def _is_xpath(locator: str) -> bool:
+    text = locator.strip()
+    return text.startswith(("xpath=", "//", "(//", "/", "./"))
+
+
+def _is_simple_token(locator: str) -> bool:
+    text = locator.strip()
+    if not text:
+        return False
+    if any(ch in text for ch in (" ", "/", "=", "[", "]", ">", ":", "(", ")")):
+        return False
+    return True
+
+
+def _candidate_selenium_locators(locator_type: Optional[str], locator: str):
+    by_map = {
+        "id": "id",
+        "name": "name",
+        "xpath": "xpath",
+        "css selector": "css selector",
+        "css_selector": "css selector",
+        "css": "css selector",
+        "class name": "class name",
+        "class_name": "class name",
+        "tag name": "tag name",
+        "tag_name": "tag name",
+        "link text": "link text",
+        "partial link text": "partial link text",
+        "partial_link_text": "partial link text",
+        "text": "link text",
+    }
+    candidates = []
+    locator_text = locator.strip()
+
+    def _add(by: str, value: str):
+        key = (by, value)
+        if key not in candidates:
+            candidates.append(key)
+
+    if locator_type and locator_type in by_map:
+        _add(by_map[locator_type], locator_text)
+
+    if locator_text.startswith("xpath="):
+        _add("xpath", locator_text[len("xpath="):])
+    if locator_text.startswith("css="):
+        _add("css selector", locator_text[len("css="):])
+    if _is_xpath(locator_text):
+        cleaned = locator_text[len("xpath="):] if locator_text.startswith("xpath=") else locator_text
+        _add("xpath", cleaned)
+    else:
+        if _is_simple_token(locator_text):
+            _add("id", locator_text)
+            _add("name", locator_text)
+        _add("css selector", locator_text)
+
+    return candidates
+
+
+def _candidate_playwright_selectors(locator_type: Optional[str], locator: str):
+    candidates = []
+    locator_text = locator.strip()
+
+    def _add(selector: str):
+        if selector and selector not in candidates:
+            candidates.append(selector)
+
+    if locator_type in ("xpath",):
+        _add(f"xpath={locator_text}")
+    elif locator_type in ("css selector", "css_selector", "css"):
+        _add(f"css={locator_text}")
+    elif locator_type == "id":
+        _add(f"css=[id=\"{locator_text}\"]")
+    elif locator_type == "name":
+        _add(f"css=[name=\"{locator_text}\"]")
+    elif locator_type in ("class name", "class_name"):
+        _add(f"css=.{locator_text}")
+    elif locator_type in ("text", "link text", "partial link text", "partial_link_text"):
+        _add(f"text={locator_text}")
+    elif locator_type == "role":
+        _add(f"role={locator_text}")
+
+    if locator_text.startswith(("css=", "xpath=", "text=", "role=")):
+        _add(locator_text)
+    elif _is_xpath(locator_text):
+        cleaned = locator_text[len("xpath="):] if locator_text.startswith("xpath=") else locator_text
+        _add(f"xpath={cleaned}")
+    else:
+        if _is_simple_token(locator_text):
+            _add(f"css=[id=\"{locator_text}\"]")
+            _add(f"css=[name=\"{locator_text}\"]")
+        _add(locator_text)
+        _add(f"css={locator_text}")
+
+    return candidates
+
+
+def _get_selenium_device_pixel_ratio(selenium_driver) -> float:
+    try:
+        raw = selenium_driver.execute_script("return window.devicePixelRatio || 1;")
+        value = float(raw)
+        return value if value > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+async def _get_playwright_device_pixel_ratio(page) -> float:
+    try:
+        raw = await page.evaluate("() => window.devicePixelRatio || 1")
+        value = float(raw)
+        return value if value > 0 else 1.0
+    except Exception:
+        return 1.0
+
+
+async def _playwright_screenshot_bytes(page) -> Tuple[bytes, bool]:
+    try:
+        return await page.screenshot(scale="css"), True
+    except TypeError:
+        return await page.screenshot(), False
+
+
+def _is_target_closed_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    name = exc.__class__.__name__.lower()
+    return "targetclosed" in name or "target page, context or browser has been closed" in message
+
+
+def _extract_selenium_bbox_from_result(step_result: Any) -> Optional[dict]:
+    direct = _bbox_from_payload(step_result)
+    if direct:
+        return direct
+    rect = getattr(step_result, "rect", None)
+    return _normalized_bbox(rect)
+
+
+async def _extract_playwright_bbox_from_result(step_result: Any) -> Optional[dict]:
+    direct = _bbox_from_payload(step_result)
+    if direct:
+        return direct
+    method = getattr(step_result, "bounding_box", None)
+    if not callable(method):
+        return None
+    maybe_bbox = method()
+    if inspect.isawaitable(maybe_bbox):
+        maybe_bbox = await maybe_bbox
+    return _normalized_bbox(maybe_bbox)
+
+
+def _resolve_selenium_bbox(selenium_driver, element_hint: Optional[dict], step_result: Any) -> Tuple[Optional[dict], float]:
+    bbox = _bbox_from_payload(element_hint) or _extract_selenium_bbox_from_result(step_result)
+    dpr = _get_selenium_device_pixel_ratio(selenium_driver)
+    if bbox:
+        return bbox, dpr
+
+    locator_type, locator = _extract_locator(element_hint)
+    if not locator:
+        return None, dpr
+
+    for by, locator_value in _candidate_selenium_locators(locator_type, locator):
+        try:
+            element = selenium_driver.find_element(by=by, value=locator_value)
+            maybe_bbox = _normalized_bbox(getattr(element, "rect", None))
+            if maybe_bbox:
+                logging.debug(f"[StepCapture] Selenium bbox resolved with by={by}")
+                return maybe_bbox, dpr
+        except Exception as exc:
+            logging.debug(f"[StepCapture] Selenium element not found by={by}: {exc}")
+    return None, dpr
+
+
+async def _resolve_playwright_bbox(page, element_hint: Optional[dict], step_result: Any) -> Tuple[Optional[dict], float]:
+    bbox = _bbox_from_payload(element_hint)
+    if not bbox:
+        bbox = await _extract_playwright_bbox_from_result(step_result)
+
+    dpr = await _get_playwright_device_pixel_ratio(page)
+    if bbox:
+        return bbox, dpr
+
+    locator_type, locator = _extract_locator(element_hint)
+    if not locator:
+        return None, dpr
+
+    for selector in _candidate_playwright_selectors(locator_type, locator):
+        try:
+            el = page.locator(selector).first
+
+            # Check quickly if element exists (no long auto-wait)
+            if await el.count() == 0:
+                continue
+
+            maybe_bbox = await el.bounding_box(timeout=100)  # 100ms max
+            normalized = _normalized_bbox(maybe_bbox)
+
+            if normalized:
+                logging.debug(f"[StepCapture] Playwright bbox resolved with selector={selector}")
+                return normalized, dpr
+
+        except Exception as exc:
+            logging.debug(f"[StepCapture] Playwright element not found selector={selector}: {exc}")
+
+    return None, dpr
+
+def _append_step_capture(run_id: str, jpeg_bytes: bytes, step_index: int = None, func_name: str = None) -> None:
     with _LOCK:
         _append_recorded_frame_locked(
             run_id=run_id,
@@ -115,18 +459,141 @@ def capture_step_frame(run_id: str, step_index: int = None, func_name: str = Non
         )
 
 
-def _png_to_jpeg_bytes(png_bytes: bytes, quality: int = 80) -> bytes:
+def _capture_step_frame_selenium(
+    run_id: str,
+    selenium_driver,
+    step_index: int = None,
+    func_name: str = None,
+    element_hint: Optional[dict] = None,
+    step_result: Any = None,
+) -> None:
+    png_bytes = selenium_driver.get_screenshot_as_png()
+    bbox = None
+    dpr = 1.0
+    if ENABLE_ELEMENT_BBOX:
+        bbox, dpr = _resolve_selenium_bbox(selenium_driver, element_hint, step_result)
+    jpeg_bytes = _image_to_jpeg_bytes(
+        png_bytes,
+        quality=STEP_CAPTURE_JPEG_QUALITY,
+        bbox=bbox,
+        bbox_scale=dpr,
+        label=func_name if bbox else None,
+    )
+    _append_step_capture(run_id, jpeg_bytes, step_index=step_index, func_name=func_name)
+
+
+async def _capture_step_frame_playwright(
+    run_id: str,
+    page,
+    step_index: int = None,
+    func_name: str = None,
+    element_hint: Optional[dict] = None,
+    step_result: Any = None,
+) -> None:
+    png_bytes, is_css_scaled = await _playwright_screenshot_bytes(page)
+    bbox = None
+    dpr = 1.0
+    if ENABLE_ELEMENT_BBOX:
+        bbox, dpr = await _resolve_playwright_bbox(page, element_hint, step_result)
+    bbox_scale = 1.0 if is_css_scaled else dpr
+    jpeg_bytes = _image_to_jpeg_bytes(
+        png_bytes,
+        quality=STEP_CAPTURE_JPEG_QUALITY,
+        bbox=bbox,
+        bbox_scale=bbox_scale,
+        label=func_name if bbox else None,
+    )
+    _append_step_capture(run_id, jpeg_bytes, step_index=step_index, func_name=func_name)
+
+
+async def capture_step_frame_async(
+    run_id: str,
+    step_index: int = None,
+    func_name: str = None,
+    element_hint: Optional[dict] = None,
+    step_result: Any = None,
+) -> None:
     """
-    Convert PNG bytes (Selenium's get_screenshot_as_png) to JPEG bytes.
+    Take a fresh screenshot from the run-owned driver and append it only to
+    that run's recording bucket. Supports Selenium and Playwright drivers.
     """
-    nparr = np.frombuffer(png_bytes, dtype=np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Failed to decode image bytes")
-    ok, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-    if not ok:
-        raise RuntimeError("Failed to encode JPEG")
-    return enc.tobytes()
+    with _LOCK:
+        if run_id not in _RECORDING_FLAGS:
+            return
+        driver = _CAPTURE_DRIVERS.get(run_id)
+        if driver is None:
+            return
+
+    selenium_driver = _get_selenium_driver(driver)
+    if selenium_driver is not None:
+        try:
+            await asyncio.to_thread(
+                _capture_step_frame_selenium,
+                run_id,
+                selenium_driver,
+                step_index,
+                func_name,
+                element_hint,
+                step_result,
+            )
+        except Exception as exc:
+            logging.warning(f"[StepCapture] Failed to capture Selenium frame for step {step_index} ({func_name}): {exc}")
+        return
+
+    page = _get_playwright_page(driver)
+    if page is not None:
+        try:
+            await _capture_step_frame_playwright(
+                run_id,
+                page,
+                step_index=step_index,
+                func_name=func_name,
+                element_hint=element_hint,
+                step_result=step_result,
+            )
+        except Exception as exc:
+            logging.warning(f"[StepCapture] Failed to capture Playwright frame for step {step_index} ({func_name}): {exc}")
+        return
+
+    logging.debug(f"[StepCapture] Unsupported driver type for run_id={run_id}")
+
+
+def capture_step_frame(
+    run_id: str,
+    step_index: int = None,
+    func_name: str = None,
+    element_hint: Optional[dict] = None,
+    step_result: Any = None,
+) -> None:
+    """
+    Backward-compatible sync wrapper around capture_step_frame_async.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        loop.create_task(
+            capture_step_frame_async(
+                run_id=run_id,
+                step_index=step_index,
+                func_name=func_name,
+                element_hint=element_hint,
+                step_result=step_result,
+            )
+        )
+        return
+
+    asyncio.run(
+        capture_step_frame_async(
+            run_id=run_id,
+            step_index=step_index,
+            func_name=func_name,
+            element_hint=element_hint,
+            step_result=step_result,
+        )
+    )
 
 
 def _stream_worker(run_id: str, driver, fps: float, jpeg_quality: int, stop_event: threading.Event, stop_timeout: Optional[float] = None):
@@ -136,10 +603,14 @@ def _stream_worker(run_id: str, driver, fps: float, jpeg_quality: int, stop_even
     interval = 1.0 / max(0.1, fps)
     logging.info(f"Stream worker started for run_id={run_id} fps={fps}")
     time_started = time.time()
+    selenium_driver = _get_selenium_driver(driver)
+    if selenium_driver is None:
+        logging.error(f"Stream worker requires Selenium-compatible driver for run_id={run_id}")
+        return
     try:
         while not stop_event.is_set() and (stop_timeout is None or (time.time() - time_started) < stop_timeout):
             try:
-                png_bytes = driver.get_driver().get_screenshot_as_png()
+                png_bytes = selenium_driver.get_screenshot_as_png()
             except Exception:
                 logging.exception(f"Failed to capture screenshot for run {run_id}")
                 stop_event.wait(interval)
@@ -154,7 +625,7 @@ def _stream_worker(run_id: str, driver, fps: float, jpeg_quality: int, stop_even
 
             with _LOCK:
                 _LATEST_FRAMES[run_id] = (jpeg_bytes, time.time())
-                _append_recorded_frame_locked(run_id=run_id, jpeg_bytes=jpeg_bytes, trigger="timer")
+                _append_recorded_timer_frame_for_linked_runs_locked(run_id, jpeg_bytes)
 
             stop_event.wait(interval)
     except Exception:
@@ -165,22 +636,57 @@ def _stream_worker(run_id: str, driver, fps: float, jpeg_quality: int, stop_even
 
 def start_stream(driver, run_id: str = "1", fps: float = 1.0, jpeg_quality: int = 70, stop_timeout: Optional[float] = 180.0) -> None:
     """
-    Start background thread capturing screenshots from `driver` for `run_id`.
-    No-op if already running. If an existing thread is found, signal it to stop and wait
-    up to `stop_timeout` seconds for it to exit before starting a new one.
+    Start streaming for `run_id`.
+    - Selenium drivers use a background thread.
+    - Playwright drivers schedule async worker on current event loop.
     """
-    with _LOCK:
-        thread = _STREAM_THREADS.get(run_id)
+    playwright_page = _get_playwright_page(driver)
+    if playwright_page is not None:
+        with _LOCK:
+            thread = _STREAM_THREADS.get(run_id)
         if thread and thread.is_alive():
-            logging.info(f"Stream already running for run_id={run_id}. Stopping (timeout={stop_timeout}).")
-            # call stop_stream which will join up to timeout
-            # drop the lock before blocking inside stop_stream (stop_stream handles locking)
+            stop_stream(run_id)
+
+        # Playwright async API must execute on a running event loop.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            loop.create_task(
+                astart_stream(
+                    driver=driver,
+                    run_id=run_id,
+                    fps=fps,
+                    jpeg_quality=jpeg_quality,
+                    stop_after=stop_timeout,
+                )
+            )
+            logging.info(f"Scheduled async Playwright stream for run_id={run_id}")
+        else:
+            logging.error(
+                f"Cannot start Playwright stream for run_id={run_id}: no running event loop. "
+                "Use `await astart_stream(...)`."
+            )
+            register_driver(run_id, driver)
+        return
+
+    _cancel_stream_task_if_any(run_id)
 
     with _LOCK:
-        # Double-check: maybe another caller started a thread meanwhile
+        thread = _STREAM_THREADS.get(run_id)
+    if thread and thread.is_alive():
+        logging.info(f"Stream already running for run_id={run_id}. Restarting stream.")
+        stop_stream(run_id)
+
+    with _LOCK:
+        # Double-check in case another caller started a thread meanwhile.
         thread = _STREAM_THREADS.get(run_id)
         if thread and thread.is_alive():
-            logging.warning(f"Unable to start new stream for run_id={run_id} because an existing thread is still alive")
+            logging.warning(
+                f"Unable to start new stream for run_id={run_id} because an existing thread is still alive"
+            )
             return
 
         stop_event = threading.Event()
@@ -230,6 +736,17 @@ def get_latest_frame(run_id: str) -> Optional[bytes]:
     with _LOCK:
         item = _LATEST_FRAMES.get(run_id)
         if item is None:
+            driver = _CAPTURE_DRIVERS.get(run_id)
+            if driver is not None:
+                for other_run_id, other_driver in _CAPTURE_DRIVERS.items():
+                    if other_run_id == run_id:
+                        continue
+                    if other_driver is not driver:
+                        continue
+                    item = _LATEST_FRAMES.get(other_run_id)
+                    if item is not None:
+                        break
+        if item is None:
             return None
         return item[0]
 
@@ -256,6 +773,12 @@ def start_recording(run_id: str) -> None:
             return
         
         _RECORDING_FLAGS.add(run_id)
+        if run_id not in _CAPTURE_DRIVERS and len(_CAPTURE_DRIVERS) == 1:
+            existing_run_id, existing_driver = next(iter(_CAPTURE_DRIVERS.items()))
+            _CAPTURE_DRIVERS[run_id] = existing_driver
+            logging.info(
+                f"Aliased capture driver from run_id={existing_run_id} to recording run_id={run_id}"
+            )
         if run_id not in _RECORDED_FRAMES:
             _RECORDED_FRAMES[run_id] = []
         if run_id not in _SEQ_COUNTERS:
@@ -461,12 +984,16 @@ async def _astream_worker(
 ):
     """
     Async worker that captures screenshots from `driver` periodically.
-    Expects `driver['page'].screenshot()` to be awaitable.
+    Expects a Playwright page-like object with awaitable `screenshot()`.
     Cancels itself when task is cancelled or stop_after exceeded.
     """
     interval = 1.0 / max(0.1, fps)
     logging.info(f"Stream worker started for run_id={run_id} fps={fps}")
     started_at = time.time()
+    page = _get_playwright_page(driver)
+    if page is None:
+        logging.error(f"[{run_id}] Async stream worker requires Playwright page-compatible driver")
+        return
     try:
         while True:
             # stop after timeout if requested
@@ -474,13 +1001,21 @@ async def _astream_worker(
                 logging.info(f"[{run_id}] stop_after reached ({stop_after}s). Exiting worker.")
                 return
 
+            if hasattr(page, "is_closed"):
+                try:
+                    if page.is_closed():
+                        logging.info(f"[{run_id}] Playwright page closed. Exiting worker.")
+                        return
+                except Exception:
+                    pass
+
             # allow cancellation
             await asyncio.sleep(0)  # cooperative cancellation point
 
             screenshot_timeout = max(5.0, interval * 2)
             try:
                 # Await screenshot with a timeout
-                png_bytes = await asyncio.wait_for(driver['page'].screenshot(), timeout=screenshot_timeout)
+                png_bytes, _ = await asyncio.wait_for(_playwright_screenshot_bytes(page), timeout=screenshot_timeout)
             except asyncio.TimeoutError:
                 logging.warning(f"[{run_id}] screenshot timed out after {screenshot_timeout}s")
                 # avoid tight loop
@@ -490,7 +1025,10 @@ async def _astream_worker(
                 # propagate cancellation cleanly
                 logging.info(f"[{run_id}] worker cancelled during screenshot.")
                 raise
-            except Exception:
+            except Exception as exc:
+                if _is_target_closed_error(exc):
+                    logging.info(f"[{run_id}] Target closed while capturing screenshot. Exiting worker.")
+                    return
                 logging.exception(f"[{run_id}] Failed to capture screenshot; stopping worker.")
                 return
 
@@ -504,7 +1042,7 @@ async def _astream_worker(
             # store latest frame and record if enabled
             with _LOCK:
                 _LATEST_FRAMES[run_id] = (jpeg_bytes, time.time())
-                _append_recorded_frame_locked(run_id=run_id, jpeg_bytes=jpeg_bytes, trigger="timer")
+                _append_recorded_timer_frame_for_linked_runs_locked(run_id, jpeg_bytes)
 
             # sleep for interval (cooperative; allows cancellation)
             try:
@@ -521,6 +1059,13 @@ async def _astream_worker(
     finally:
         logging.info(f"Stream worker exiting for run_id={run_id}")
 
+
+def _cancel_stream_task_if_any(run_id: str) -> None:
+    task = _STREAM_TASKS.get(run_id)
+    if task and not task.done():
+        task.cancel()
+
+
 async def astart_stream(
     driver,
     run_id: str = "1",
@@ -532,6 +1077,17 @@ async def astart_stream(
     Start an async streaming task for `run_id`. No-op if already running.
     If an existing task is found and is still running, returns without starting a new one.
     """
+    page = _get_playwright_page(driver)
+    if page is None:
+        logging.error(f"Cannot start async stream for run_id={run_id}: Playwright page not found in driver")
+        register_driver(run_id, driver)
+        return
+
+    with _LOCK:
+        thread = _STREAM_THREADS.get(run_id)
+    if thread and thread.is_alive():
+        await asyncio.to_thread(stop_stream, run_id)
+
     existing = _STREAM_TASKS.get(run_id)
     if existing and not existing.done():
         logging.info(f"Stream already running for run_id={run_id}; start_stream no-op.")
