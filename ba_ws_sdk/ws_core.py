@@ -13,6 +13,77 @@ from . import streaming
 
 from typing import Optional, Callable
 
+
+def _is_sensitive_field(value: str) -> bool:
+    lower = value.lower()
+    return any(token in lower for token in ("password", "passwd", "pwd", "token", "secret", "api_key", "apikey"))
+
+
+def _preview_value(value, max_len: int = 60) -> str:
+    text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
+
+
+def _format_locator(kwargs: dict) -> str:
+    locator_type = kwargs.get("locator_type")
+    locator = kwargs.get("locator")
+    if locator_type and locator:
+        return f"{locator_type}:{locator}"
+    if locator:
+        return str(locator)
+    return ""
+
+
+def _format_step_output(func_name: str, args: list, kwargs: dict, raw_result) -> str:
+    locator_repr = _format_locator(kwargs)
+
+    if func_name == "create_driver":
+        return "create_driver"
+    if func_name == "stop_driver":
+        return "stop_driver"
+    if func_name == "navigate_to_url":
+        url = kwargs.get("url")
+        if url is None and args:
+            url = args[0]
+        return f"navigate_to_url url={_preview_value(url)}" if url is not None else "navigate_to_url"
+    if func_name == "click":
+        return f"click locator={locator_repr}" if locator_repr else "click"
+    if func_name == "scroll_to_element":
+        return f"scroll_to_element locator={locator_repr}" if locator_repr else "scroll_to_element"
+    if func_name == "send_keys":
+        value = kwargs.get("value")
+        if value is None and len(args) >= 3:
+            value = args[2]
+        sensitive_hint = " ".join(str(x) for x in (kwargs.get("locator"), kwargs.get("name"), kwargs.get("key")) if x)
+        if _is_sensitive_field(sensitive_hint):
+            value_repr = "<redacted>"
+        else:
+            value_repr = _preview_value(value) if value is not None else ""
+        if locator_repr and value_repr:
+            return f"send_keys locator={locator_repr} value={value_repr}"
+        if locator_repr:
+            return f"send_keys locator={locator_repr}"
+        return "send_keys"
+    if func_name == "get_page_html":
+        text = raw_result if isinstance(raw_result, str) else str(raw_result)
+        return f"get_page_html captured chars={len(text)}"
+    if func_name == "exists":
+        return f"exists locator={locator_repr}" if locator_repr else "exists"
+    if func_name == "does_not_exist":
+        return f"does_not_exist locator={locator_repr}" if locator_repr else "does_not_exist"
+    if func_name == "exists_with_text":
+        text = kwargs.get("text")
+        if text is None and args:
+            text = args[0]
+        return f"exists_with_text text={_preview_value(text)}" if text is not None else "exists_with_text"
+
+    raw_text = raw_result if isinstance(raw_result, str) else str(raw_result)
+    if raw_text and raw_text.lower() not in ("success", "ok"):
+        return f"{func_name} result={_preview_value(raw_text)}"
+    return func_name
+
 # You will need to pass these in from your main app:
 # import agent_func
 # import streaming
@@ -48,10 +119,17 @@ def _make_envelope(header: dict, payload_bytes: bytes) -> bytes:
     header_len = len(header_json)
     return struct.pack(">I", header_len) + header_json + payload_bytes
 
-async def stream_frames_direct(base_ws_uri, run_id, get_latest_frame, interval=0.5, retry_delay=5.0):
-    stream_uri = base_ws_uri + run_id + "-stream"
-    last_hash = None
-    last_sent_ts = None
+async def stream_frames_direct(
+    base_ws_uri,
+    stream_socket_id,
+    get_latest_frame,
+    get_active_capture_run_ids,
+    interval=0.5,
+    retry_delay=5.0,
+):
+    stream_uri = base_ws_uri + stream_socket_id + "-stream"
+    last_hash_by_run = {}
+    last_sent_ts_by_run = {}
     logging.info(f"[Direct] Starting dedicated stream loop to: {stream_uri}")
 
     while True:
@@ -60,22 +138,30 @@ async def stream_frames_direct(base_ws_uri, run_id, get_latest_frame, interval=0
                 logging.info(f"[Direct] Connected to streaming endpoint: {stream_uri}")
                 while True:
                     try:
-                        frame_bytes = await asyncio.get_running_loop().run_in_executor(
-                            None, lambda: get_latest_frame(run_id)
+                        run_ids = await asyncio.get_running_loop().run_in_executor(
+                            None, get_active_capture_run_ids
                         )
                     except Exception:
-                        frame_bytes = None
+                        run_ids = []
 
-                    now = time.time()
-                    if frame_bytes:
-                        h = hashlib.sha256(frame_bytes).hexdigest()
-                        if h != last_hash:
-                            seq = int(last_sent_ts or now)
-                            header = {"id": run_id, "type": "screenshot", "seq": seq}
-                            envelope = _make_envelope(header, frame_bytes)
-                            await ws.send(envelope)
-                            last_hash = h
-                            last_sent_ts = now
+                    for run_id in run_ids:
+                        try:
+                            frame_bytes = await asyncio.get_running_loop().run_in_executor(
+                                None, lambda rid=run_id: get_latest_frame(rid)
+                            )
+                        except Exception:
+                            frame_bytes = None
+
+                        now = time.time()
+                        if frame_bytes:
+                            h = hashlib.sha256(frame_bytes).hexdigest()
+                            if h != last_hash_by_run.get(run_id):
+                                seq = int(last_sent_ts_by_run.get(run_id) or now)
+                                header = {"id": run_id, "type": "screenshot", "seq": seq}
+                                envelope = _make_envelope(header, frame_bytes)
+                                await ws.send(envelope)
+                                last_hash_by_run[run_id] = h
+                                last_sent_ts_by_run[run_id] = now
                     await asyncio.sleep(interval)
         except (websockets.exceptions.WebSocketException, OSError) as e:
             logging.error(f"[Direct] Stream connection failed: {e}. Retrying in {retry_delay}s...")
@@ -108,22 +194,135 @@ async def stream_frames_multiplex(ws, run_id, get_latest_frame, interval=1.0):
             logging.exception("[Manager] Error in multiplex stream")
             break
 
+
 async def call_maybe_blocking(func, *args, **kwargs):
     if asyncio.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
+
+async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "1") -> dict:
+    executed_lines = 0
+    results = []
+    driver_created_for = set()
+
+    try:
+        for i, command in enumerate(commands):
+            func_name = command.get("function")
+            args = command.get("args", []) or []
+            kwargs = command.get("kwargs", {}) or {}
+            command_run_id = kwargs.get("_run_test_id") or run_id
+
+            if func_name == "create_driver":
+                driver_created_for.add(command_run_id)
+            if func_name == "stop_driver":
+                driver_created_for.discard(command_run_id)
+
+            if func_name not in FUNCTION_MAP:
+                error_msg = f"Unknown function: {func_name}"
+                results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "error", "output": error_msg})
+                return {
+                    "status": "error",
+                    "executed_lines": executed_lines,
+                    "failed_index": i,
+                    "failed_function": func_name,
+                    "error_details": error_msg,
+                    "message": f"Macro halted at index {i} due to error.",
+                    "results": results
+                }
+
+            try:
+                if "_run_test_id" not in kwargs:
+                    kwargs = dict(kwargs)
+                    kwargs["_run_test_id"] = command_run_id
+
+                result = await call_maybe_blocking(FUNCTION_MAP[func_name], *args, **kwargs)
+                if isinstance(result, dict) and result.get("status") == "error":
+                    error_msg = result.get("error", "Unknown error from function")
+                    results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "error", "output": error_msg})
+                    return {
+                        "status": "error",
+                        "executed_lines": executed_lines,
+                        "failed_index": i,
+                        "failed_function": func_name,
+                        "error_details": error_msg,
+                        "message": f"Macro halted at index {i} due to error.",
+                        "results": results
+                    }
+                rich_output_enabled = os.getenv("BARKO_RICH_BULK_OUTPUT", "1").lower() not in ("0", "false", "no")
+                raw_output = result if isinstance(result, (str, dict, list)) else str(result)
+                if rich_output_enabled:
+                    output = _format_step_output(func_name, args, kwargs, raw_output)
+                else:
+                    output = raw_output if isinstance(raw_output, str) else str(raw_output)
+                results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "success", "output": output, "raw_output": raw_output})
+            except Exception as e:
+                logging.error(f"[BulkExec] Step {i} ({func_name}) failed: {e}")
+                error_msg = str(e)
+                results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "error", "output": error_msg})
+                return {
+                    "status": "error",
+                    "executed_lines": executed_lines,
+                    "failed_index": i,
+                    "failed_function": func_name,
+                    "error_details": error_msg,
+                    "message": f"Macro halted at index {i} due to error.",
+                    "results": results
+                }
+
+            executed_lines += 1
+
+            # Capture a persistent frame after each step (skip stop_driver since browser is dead)
+            if func_name != "stop_driver":
+                try:
+                    streaming.capture_step_frame(
+                        run_id=command_run_id, step_index=i, func_name=func_name
+                    )
+                except Exception:
+                    pass  # Non-fatal: recording is best-effort
+
+        return {
+            "status": "success",
+            "executed_lines": executed_lines,
+            "failed_index": None,
+            "error_details": None,
+            "message": f"Successfully executed {executed_lines} commands sequentially.",
+            "results": results
+        }
+    except Exception as e:
+        logging.error(f"[BulkExec] Fatal error in macro execution: {e}")
+        return {
+            "status": "error",
+            "executed_lines": executed_lines,
+            "failed_index": None,
+            "failed_function": None,
+            "error_details": str(e),
+            "message": "Macro execution failed due to an unexpected error.",
+            "results": results
+        }
+    finally:
+        if driver_created_for:
+            for created_run_id in sorted(driver_created_for):
+                logging.info(
+                    f"[BulkExec] macro failure for ({created_run_id}) ."
+                )
+    
 
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     response_dict = {}
     message_id = None
     try:
         data = json.loads(message)
-        message_id = data.get("id") or data.get("kwargs", {}).get("_run_test_id")
+        message_id = data.get("id") or (data.get("kwargs", {}) or {}).get("_run_test_id")
         function_name = data.get("function")
         args = data.get("args", []) or []
         kwargs = data.get("kwargs", {}) or {}
 
-        response_dict = {"id": message_id} if message_id else {}
+        if not message_id:
+            return json.dumps(
+                {"status": "error", "error": "Missing required envelope id (run_id)."}
+            )
+
+        response_dict = {"id": message_id}
 
         if function_name == "list_available_methods":
             method_details = []
@@ -142,13 +341,29 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
             })
             return json.dumps(response_dict)
 
+        if function_name == "execute_macro_bulk":
+            commands = args[0] if args else kwargs.get("commands", [])
+            _run_test_id = kwargs.get("_run_test_id") or message_id
+            result = await execute_macro_bulk(commands, FUNCTION_MAP, run_id=_run_test_id)
+            response_dict.update(result)
+            return json.dumps(response_dict)
+
         if function_name in SYSTEM_FUNCTIONS:
+            if "_run_test_id" not in kwargs:
+                sig = inspect.signature(SYSTEM_FUNCTIONS[function_name])
+                if "_run_test_id" in sig.parameters:
+                    kwargs = dict(kwargs)
+                    kwargs["_run_test_id"] = message_id
             result = await call_maybe_blocking(SYSTEM_FUNCTIONS[function_name], *args, **kwargs)
             response_dict.update({"status": "success", "result": result})
             logging.info(f"Executed SYSTEM function: {function_name}")
             return json.dumps(response_dict)
 
         if function_name in FUNCTION_MAP:
+            sig = inspect.signature(FUNCTION_MAP[function_name])
+            if "_run_test_id" in sig.parameters and "_run_test_id" not in kwargs:
+                kwargs = dict(kwargs)
+                kwargs["_run_test_id"] = message_id
             result = await call_maybe_blocking(FUNCTION_MAP[function_name], *args, **kwargs)
             response_dict.update({"status": "success", "result": result})
         else:
@@ -202,7 +417,7 @@ async def main_connect_ws(agent_func):
     SEM = get_semaphore()
     FUNCTION_MAP = build_function_map(agent_func)
     SYSTEM_FUNCTIONS = build_system_functions()
-    from .streaming import get_latest_frame
+    from .streaming import get_latest_frame, get_active_capture_run_ids
 
     raw_uri = os.getenv("BACKEND_WS_URI", "default_client_id")
     full_uri = _build_uri(raw_uri)
@@ -218,7 +433,11 @@ async def main_connect_ws(agent_func):
         ]
         if enable_streaming:
             tasks.append(
-                asyncio.create_task(stream_frames_direct(full_uri, run_id, get_latest_frame))
+                asyncio.create_task(
+                    stream_frames_direct(
+                        full_uri, run_id, get_latest_frame, get_active_capture_run_ids
+                    )
+                )
             )
         await asyncio.gather(*tasks)
     else:
