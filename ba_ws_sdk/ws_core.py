@@ -11,7 +11,7 @@ import struct
 import hashlib
 from . import streaming
 
-from typing import Optional, Callable
+from typing import Any, Optional
 
 
 def _is_sensitive_field(value: str) -> bool:
@@ -34,6 +34,114 @@ def _format_locator(kwargs: dict) -> str:
     if locator:
         return str(locator)
     return ""
+
+
+def _extract_element_hint(args: list, kwargs: dict, raw_result: Any) -> Optional[dict]:
+    """
+    Build a function-agnostic hint that can be used by streaming to locate and
+    highlight an element in the screenshot.
+    """
+    hint = {}
+    known_types = {
+        "id", "name", "xpath", "css", "css selector", "css_selector",
+        "class name", "class_name", "tag name", "tag_name",
+        "link text", "partial link text", "partial_link_text",
+        "text", "role",
+    }
+
+    def _norm_type(value):
+        if not isinstance(value, str):
+            return None
+        t = value.strip().lower()
+        return t if t in known_types else None
+
+    def _looks_like_locator(value: str) -> bool:
+        text = value.strip()
+        if not text or "://" in text:
+            return False
+        if text.startswith(("xpath=", "css=", "text=", "role=", "//", "(//", "#", ".", "[")):
+            return True
+        if text.startswith(("/", "./")):
+            return True
+        if " " in text and not text.startswith(("//", "(//", "text=")):
+            return False
+        return True
+
+    def _pick_from_mapping(mapping: dict):
+        locator_type = _norm_type(mapping.get("locator_type") or mapping.get("by") or mapping.get("type"))
+        locator = (
+            mapping.get("locator")
+            or mapping.get("selector")
+            or mapping.get("value")
+            or mapping.get("query")
+            or mapping.get("xpath")
+            or mapping.get("css_selector")
+            or mapping.get("css")
+        )
+        if locator is None and mapping.get("id") is not None:
+            locator_type = locator_type or "id"
+            locator = mapping.get("id")
+        if locator is None and mapping.get("name") is not None:
+            locator_type = locator_type or "name"
+            locator = mapping.get("name")
+        if locator is None and mapping.get("text") is not None:
+            locator_type = locator_type or "text"
+            locator = mapping.get("text")
+        if isinstance(locator, str) and locator.strip():
+            return locator_type, locator.strip()
+        return locator_type, None
+
+    locator_type, locator = _pick_from_mapping(kwargs)
+
+    nested_locator = kwargs.get("locator")
+    if not locator and isinstance(nested_locator, dict):
+        nested_type, nested_value = _pick_from_mapping(nested_locator)
+        locator_type = locator_type or nested_type
+        locator = locator or nested_value
+
+    if not locator:
+        for arg in args:
+            if isinstance(arg, dict):
+                nested_type, nested_value = _pick_from_mapping(arg)
+                locator_type = locator_type or nested_type
+                locator = locator or nested_value
+                if locator:
+                    break
+
+    # Common positional pattern: (locator_type, locator, ...)
+    if not locator and len(args) >= 2:
+        if isinstance(args[0], str) and isinstance(args[1], str):
+            norm_type = _norm_type(args[0])
+            if norm_type:
+                locator_type = locator_type or norm_type
+                locator = args[1].strip()
+
+    if not locator:
+        for arg in args:
+            if isinstance(arg, str) and _looks_like_locator(arg):
+                locator = arg.strip()
+                break
+
+    if locator_type and locator:
+        hint["locator_type"] = locator_type
+        hint["locator"] = locator
+    elif locator:
+        hint["locator"] = locator
+
+    # If an action already returns a bbox-like payload, forward it directly.
+    if isinstance(raw_result, dict):
+        box = raw_result.get("bounding_box")
+        if isinstance(box, dict):
+            hint["bounding_box"] = box
+        elif all(k in raw_result for k in ("x", "y", "width", "height")):
+            hint["bounding_box"] = {
+                "x": raw_result.get("x"),
+                "y": raw_result.get("y"),
+                "width": raw_result.get("width"),
+                "height": raw_result.get("height"),
+            }
+
+    return hint or None
 
 
 def _format_step_output(func_name: str, args: list, kwargs: dict, raw_result) -> str:
@@ -170,22 +278,40 @@ async def stream_frames_direct(
             logging.exception("[Direct] Unexpected error in stream loop")
             await asyncio.sleep(retry_delay)
 
-async def stream_frames_multiplex(ws, run_id, get_latest_frame, interval=1.0):
-    last_hash = None
-    logging.info(f"[Manager] Starting multiplexed stream for run_id: {run_id}")
+async def stream_frames_multiplex(ws, get_latest_frame, get_active_capture_run_ids, interval=1.0):
+    last_hash_by_run = {}
+    logging.info("[Manager] Starting multiplexed stream for active run_ids")
 
     while True:
         try:
-            frame = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: get_latest_frame(run_id)
-            )
-            if frame:
+            try:
+                run_ids = await asyncio.get_running_loop().run_in_executor(
+                    None, get_active_capture_run_ids
+                )
+            except Exception:
+                run_ids = []
+
+            for run_id in run_ids:
+                try:
+                    frame = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda rid=run_id: get_latest_frame(rid)
+                    )
+                except Exception:
+                    frame = None
+                if not frame:
+                    continue
                 h = hashlib.sha256(frame).hexdigest()
-                if h != last_hash:
+                if h != last_hash_by_run.get(run_id):
                     header = {"id": run_id, "type": "screenshot", "seq": int(time.time())}
                     envelope = _make_envelope(header, frame)
                     await ws.send(envelope)
-                    last_hash = h
+                    last_hash_by_run[run_id] = h
+
+            # Cleanup stale hash entries
+            active = set(run_ids)
+            for stale in list(last_hash_by_run.keys()):
+                if stale not in active:
+                    last_hash_by_run.pop(stale, None)
             await asyncio.sleep(interval)
         except websockets.exceptions.ConnectionClosed:
             logging.warning("[Manager] WebSocket closed, stopping multiplex stream task.")
@@ -248,6 +374,7 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
                         "message": f"Macro halted at index {i} due to error.",
                         "results": results
                     }
+                element_hint = _extract_element_hint(args, kwargs, result)
                 rich_output_enabled = os.getenv("BARKO_RICH_BULK_OUTPUT", "1").lower() not in ("0", "false", "no")
                 raw_output = result if isinstance(result, (str, dict, list)) else str(result)
                 if rich_output_enabled:
@@ -274,8 +401,12 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
             # Capture a persistent frame after each step (skip stop_driver since browser is dead)
             if func_name != "stop_driver":
                 try:
-                    streaming.capture_step_frame(
-                        run_id=command_run_id, step_index=i, func_name=func_name
+                    await streaming.capture_step_frame_async(
+                        run_id=command_run_id,
+                        step_index=i,
+                        func_name=func_name,
+                        element_hint=element_hint,
+                        step_result=result,
                     )
                 except Exception:
                     pass  # Non-fatal: recording is best-effort
@@ -394,8 +525,7 @@ def _build_uri(base_or_id: str) -> str:
     default_base = os.getenv("DEFAULT_WS_BASE", "wss://beta.barkoagent.com/ws/")
     return f"{default_base.rstrip('/')}/{base_or_id.lstrip('/')}"
 
-async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS, get_latest_frame):
-    run_id = os.getenv("STREAMING_RUN_ID", "1")
+async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS, get_latest_frame, get_active_capture_run_ids):
     enable_streaming = os.getenv("ENABLE_STREAMING", "true").lower() in ("1", "true", "yes")
     logging.info(f"Connecting to Backend ({connection_type}): {uri}")
 
@@ -405,7 +535,11 @@ async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUN
                 logging.info("Command connection established.")
                 tasks = [asyncio.create_task(command_loop(ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS))]
                 if connection_type == "manager" and enable_streaming:
-                    tasks.append(asyncio.create_task(stream_frames_multiplex(ws, run_id, get_latest_frame)))
+                    tasks.append(
+                        asyncio.create_task(
+                            stream_frames_multiplex(ws, get_latest_frame, get_active_capture_run_ids)
+                        )
+                    )
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
                 for task in pending: task.cancel()
         except Exception as e:
@@ -429,7 +563,11 @@ async def main_connect_ws(agent_func):
 
     if conn_type == "direct":
         tasks = [
-            asyncio.create_task(connect_to_backend(full_uri, "direct", SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS, get_latest_frame)),
+            asyncio.create_task(
+                connect_to_backend(
+                    full_uri, "direct", SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS, get_latest_frame, get_active_capture_run_ids
+                )
+            ),
         ]
         if enable_streaming:
             tasks.append(
@@ -441,4 +579,6 @@ async def main_connect_ws(agent_func):
             )
         await asyncio.gather(*tasks)
     else:
-        await connect_to_backend(full_uri, "manager", SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS, get_latest_frame)
+        await connect_to_backend(
+            full_uri, "manager", SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS, get_latest_frame, get_active_capture_run_ids
+        )
