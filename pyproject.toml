@@ -20,8 +20,18 @@ dependencies = [
   "python-dotenv>=0.21.0",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+  "ruff>=0.4.0",
+]
+
 [project.urls]
 Homepage = "https://barkoagent.com"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 120
