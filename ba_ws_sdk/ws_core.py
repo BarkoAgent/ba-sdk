@@ -227,6 +227,135 @@ def _make_envelope(header: dict, payload_bytes: bytes) -> bytes:
     header_len = len(header_json)
     return struct.pack(">I", header_len) + header_json + payload_bytes
 
+
+def _parse_envelope(data: bytes) -> tuple:
+    """Parse binary envelope: [4B header_len][header JSON][payload]."""
+    if len(data) < 4:
+        raise ValueError("Envelope too small")
+    header_len = struct.unpack(">I", data[:4])[0]
+    if len(data) < 4 + header_len:
+        raise ValueError("Incomplete envelope header")
+    header = json.loads(data[4:4 + header_len].decode("utf-8"))
+    payload = data[4 + header_len:]
+    return header, payload
+
+
+# ─── Chunked file upload state ──────────────────────────────────────────────
+_pending_uploads: dict = {}  # msg_id -> {project_id, file_name, total_size, temp_path, hasher, bytes_received, file_handle}
+
+
+def _get_agent_func_module():
+    """Late import to avoid circular dependency."""
+    try:
+        import agent_func
+        return agent_func
+    except ImportError:
+        return None
+
+
+async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
+    """
+    Process a file upload binary envelope (START / CHUNK / END).
+    Sends JSON text response on completion or error.
+    """
+    msg_type = header.get("type", "")
+    msg_id = header.get("id", "")
+
+    if msg_type == "file_upload_start":
+        file_name = header.get("file_name", "")
+        total_size = header.get("total_size", 0)
+
+        agent_func = _get_agent_func_module()
+        if agent_func:
+            try:
+                safe_name = agent_func.sanitize_filename(file_name)
+            except ValueError as e:
+                await ws.send(json.dumps({"id": msg_id, "status": "error", "error": f"Invalid filename: {e}"}))
+                return
+        else:
+            safe_name = file_name
+
+        # Create temp file in attachments dir (co-located with agent_func.py)
+        agent_func_mod = _get_agent_func_module()
+        if agent_func_mod and hasattr(agent_func_mod, 'ATTACHMENTS_DIR'):
+            attachments_dir = str(agent_func_mod.ATTACHMENTS_DIR)
+        else:
+            attachments_dir = "./attachments"
+        os.makedirs(attachments_dir, exist_ok=True)
+        temp_path = os.path.join(attachments_dir, f".tmp_{msg_id}")
+
+        _pending_uploads[msg_id] = {
+            "file_name": safe_name,
+            "total_size": total_size,
+            "temp_path": temp_path,
+            "hasher": hashlib.sha256(),
+            "bytes_received": 0,
+            "file_handle": open(temp_path, "wb"),
+        }
+        logging.info(f"[FileUpload] START {safe_name} (expected {total_size} bytes)")
+
+    elif msg_type == "file_upload_chunk":
+        upload = _pending_uploads.get(msg_id)
+        if not upload:
+            logging.warning(f"[FileUpload] CHUNK for unknown upload {msg_id}")
+            return
+        upload["file_handle"].write(payload)
+        upload["hasher"].update(payload)
+        upload["bytes_received"] += len(payload)
+
+    elif msg_type == "file_upload_end":
+        upload = _pending_uploads.pop(msg_id, None)
+        if not upload:
+            await ws.send(json.dumps({"id": msg_id, "status": "error", "error": "No pending upload"}))
+            return
+
+        upload["file_handle"].close()
+        expected_sha = header.get("sha256", "")
+        actual_sha = upload["hasher"].hexdigest()
+
+        if expected_sha and actual_sha != expected_sha:
+            # Checksum mismatch — delete temp
+            try:
+                os.unlink(upload["temp_path"])
+            except OSError:
+                pass
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "status": "error",
+                "error": f"Checksum mismatch: expected {expected_sha}, got {actual_sha}",
+            }))
+            logging.error(f"[FileUpload] Checksum mismatch for {upload['file_name']}")
+            return
+
+        # Rename temp -> final (use same resolved dir as start)
+        agent_func_fin = _get_agent_func_module()
+        if agent_func_fin and hasattr(agent_func_fin, 'ATTACHMENTS_DIR'):
+            final_dir = str(agent_func_fin.ATTACHMENTS_DIR)
+        else:
+            final_dir = "./attachments"
+        final_path = os.path.join(final_dir, upload["file_name"])
+        try:
+            os.replace(upload["temp_path"], final_path)
+        except OSError as e:
+            await ws.send(json.dumps({"id": msg_id, "status": "error", "error": str(e)}))
+            return
+
+        # Invalidate cache
+        agent_func = _get_agent_func_module()
+        if agent_func:
+            agent_func._invalidate_cache()
+
+        logging.info(
+            f"[FileUpload] COMPLETE {upload['file_name']} "
+            f"({upload['bytes_received']} bytes, sha256={actual_sha[:12]}...)"
+        )
+        await ws.send(json.dumps({
+            "id": msg_id,
+            "status": "success",
+            "file_name": upload["file_name"],
+            "bytes_received": upload["bytes_received"],
+        }))
+
 async def stream_frames_direct(
     base_ws_uri,
     stream_socket_id,
@@ -460,7 +589,15 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
             for name, func in FUNCTION_MAP.items():
                 sig = inspect.signature(func)
                 arg_names = [p.name for p in sig.parameters.values() if p.name != "_run_test_id"]
-                method_details.append({"name": name, "args": arg_names, "doc": func.__doc__ or ""})
+                # Collect default values for optional parameters
+                defaults = {}
+                for p in sig.parameters.values():
+                    if p.name != "_run_test_id" and p.default is not inspect.Parameter.empty:
+                        defaults[p.name] = p.default
+                detail = {"name": name, "args": arg_names, "doc": func.__doc__ or ""}
+                if defaults:
+                    detail["defaults"] = defaults
+                method_details.append(detail)
             system_methods = [
                 {"name": name, "args": [], "doc": "[SYSTEM]"} 
                 for name in SYSTEM_FUNCTIONS.keys()
@@ -517,7 +654,19 @@ async def handle_and_send(message, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS):
 async def command_loop(ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     while True:
         msg = await ws.recv()
-        asyncio.create_task(handle_and_send(msg, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS))
+        # Binary messages are file upload envelopes
+        if isinstance(msg, bytes):
+            try:
+                header, payload = _parse_envelope(msg)
+                msg_type = header.get("type", "")
+                if msg_type.startswith("file_upload_"):
+                    await handle_file_upload_envelope(header, payload, ws)
+                else:
+                    logging.warning(f"[WS] Unknown binary envelope type: {msg_type}")
+            except Exception as e:
+                logging.error(f"[WS] Error handling binary message: {e}")
+        else:
+            asyncio.create_task(handle_and_send(msg, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS))
 
 def _build_uri(base_or_id: str) -> str:
     if base_or_id.startswith("ws://") or base_or_id.startswith("wss://"):
