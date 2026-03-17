@@ -345,7 +345,10 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
             return
         # Enforce size limit even if total_size header was wrong/missing
         if upload["bytes_received"] + len(payload) > MAX_UPLOAD_BYTES:
-            upload["file_handle"].close()
+            try:
+                upload["file_handle"].close()
+            except Exception:
+                pass
             try:
                 os.unlink(upload["temp_path"])
             except OSError:
@@ -366,7 +369,10 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
             await ws.send(json.dumps({"id": msg_id, "status": "error", "error": "No pending upload"}))
             return
 
-        upload["file_handle"].close()
+        try:
+            upload["file_handle"].close()
+        except Exception:
+            pass
         expected_sha = header.get("sha256", "")
         actual_sha = upload["hasher"].hexdigest()
 
