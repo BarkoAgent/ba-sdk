@@ -293,8 +293,14 @@ async def read_agent_file(
         })
 
     total_size = target.stat().st_size
-    byte_offset = int(offset)
-    byte_length = int(length) if length else DEFAULT_READ_BYTES
+    try:
+        byte_offset = int(offset)
+    except (TypeError, ValueError):
+        byte_offset = 0
+    try:
+        byte_length = int(length) if length else DEFAULT_READ_BYTES
+    except (TypeError, ValueError):
+        byte_length = DEFAULT_READ_BYTES
     byte_length = min(byte_length, MAX_READ_BYTES)
     byte_offset = max(0, min(byte_offset, total_size))
 

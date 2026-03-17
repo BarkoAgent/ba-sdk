@@ -262,7 +262,23 @@ def _parse_envelope(data: bytes) -> tuple:
 
 
 # ─── Chunked file upload state ──────────────────────────────────────────────
-_pending_uploads: dict = {}  # msg_id -> {project_id, file_name, total_size, temp_path, hasher, bytes_received, file_handle}
+_pending_uploads: dict = {}  # msg_id -> {file_name, total_size, temp_path, hasher, bytes_received, file_handle}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))  # 100MB default
+
+
+def _cleanup_pending_uploads():
+    """Close file handles and remove temp files for all pending uploads."""
+    for msg_id, upload in list(_pending_uploads.items()):
+        try:
+            upload["file_handle"].close()
+        except Exception:
+            pass
+        try:
+            os.unlink(upload["temp_path"])
+        except OSError:
+            pass
+        logging.info(f"[FileUpload] Cleaned up stale upload {msg_id} ({upload['file_name']})")
+    _pending_uploads.clear()
 
 
 async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
@@ -292,6 +308,18 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
             await ws.send(json.dumps({"id": msg_id, "status": "error", "error": f"Invalid filename: {e}"}))
             return
 
+        # Validate upload size
+        try:
+            total_size = int(total_size)
+        except (TypeError, ValueError):
+            total_size = 0
+        if total_size > MAX_UPLOAD_BYTES:
+            await ws.send(json.dumps({
+                "id": msg_id, "status": "error",
+                "error": f"File too large: {total_size} bytes exceeds limit of {MAX_UPLOAD_BYTES} bytes",
+            }))
+            return
+
         attachments_dir = str(file_system.get_attachments_dir())
         os.makedirs(attachments_dir, exist_ok=True)
         temp_path = os.path.join(attachments_dir, f".tmp_{msg_id}")
@@ -310,6 +338,23 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
         upload = _pending_uploads.get(msg_id)
         if not upload:
             logging.warning(f"[FileUpload] CHUNK for unknown upload {msg_id}")
+            await ws.send(json.dumps({
+                "id": msg_id, "status": "error",
+                "error": "No pending upload for this id. Upload may have been cancelled or timed out.",
+            }))
+            return
+        # Enforce size limit even if total_size header was wrong/missing
+        if upload["bytes_received"] + len(payload) > MAX_UPLOAD_BYTES:
+            upload["file_handle"].close()
+            try:
+                os.unlink(upload["temp_path"])
+            except OSError:
+                pass
+            _pending_uploads.pop(msg_id, None)
+            await ws.send(json.dumps({
+                "id": msg_id, "status": "error",
+                "error": f"Upload exceeded size limit of {MAX_UPLOAD_BYTES} bytes",
+            }))
             return
         upload["file_handle"].write(payload)
         upload["hasher"].update(payload)
@@ -696,6 +741,8 @@ async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUN
                 for task in pending: task.cancel()
         except Exception as e:
             logging.error(f"Connection lost: {e}. Reconnecting in 5s...")
+        # Clean up any in-progress uploads (file handles + temp files)
+        _cleanup_pending_uploads()
         await asyncio.sleep(5)
 
 async def main_connect_ws(agent_func):
