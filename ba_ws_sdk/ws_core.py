@@ -11,6 +11,12 @@ import struct
 import hashlib
 from . import streaming
 
+try:
+    from . import file_system
+except ImportError:
+    file_system = None          # SDK deployed without file_system.py — degrade gracefully
+    logging.warning("[SDK] file_system module not found — file management features disabled")
+
 from typing import Any, Optional
 
 
@@ -186,6 +192,14 @@ def _format_step_output(func_name: str, args: list, kwargs: dict, raw_result) ->
         if text is None and args:
             text = args[0]
         return f"exists_with_text text={_preview_value(text)}" if text is not None else "exists_with_text"
+    if func_name == "wait_for_download":
+        try:
+            parsed = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+            if isinstance(parsed, dict) and parsed.get("status") == "success":
+                return f"wait_for_download file={parsed.get('file_name')} size={parsed.get('size_bytes')}"
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return f"wait_for_download result={_preview_value(raw_result)}"
 
     raw_text = raw_result if isinstance(raw_result, str) else str(raw_result)
     if raw_text and raw_text.lower() not in ("success", "ok"):
@@ -207,11 +221,18 @@ def get_semaphore():
     return asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 def build_function_map(agent_func):
-    return {
+    func_map = {
         name: obj
         for name, obj in inspect.getmembers(agent_func, inspect.isfunction)
         if not name.startswith("_")
     }
+    # Merge SDK-provided file management functions (agent can override if needed)
+    if file_system is not None:
+        fs_funcs = file_system.get_agent_functions()
+        for name, func in fs_funcs.items():
+            if name not in func_map:
+                func_map[name] = func
+    return func_map
 
 def build_system_functions():
     return {
@@ -244,20 +265,20 @@ def _parse_envelope(data: bytes) -> tuple:
 _pending_uploads: dict = {}  # msg_id -> {project_id, file_name, total_size, temp_path, hasher, bytes_received, file_handle}
 
 
-def _get_agent_func_module():
-    """Late import to avoid circular dependency."""
-    try:
-        import agent_func
-        return agent_func
-    except ImportError:
-        return None
-
-
 async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
     """
     Process a file upload binary envelope (START / CHUNK / END).
     Sends JSON text response on completion or error.
     """
+    if file_system is None:
+        msg_id = header.get("id", "")
+        await ws.send(json.dumps({
+            "id": msg_id,
+            "status": "error",
+            "error": "File management not available — SDK file_system module is missing",
+        }))
+        return
+
     msg_type = header.get("type", "")
     msg_id = header.get("id", "")
 
@@ -265,22 +286,13 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
         file_name = header.get("file_name", "")
         total_size = header.get("total_size", 0)
 
-        agent_func = _get_agent_func_module()
-        if agent_func:
-            try:
-                safe_name = agent_func.sanitize_filename(file_name)
-            except ValueError as e:
-                await ws.send(json.dumps({"id": msg_id, "status": "error", "error": f"Invalid filename: {e}"}))
-                return
-        else:
-            safe_name = file_name
+        try:
+            safe_name = file_system.sanitize_filename(file_name)
+        except ValueError as e:
+            await ws.send(json.dumps({"id": msg_id, "status": "error", "error": f"Invalid filename: {e}"}))
+            return
 
-        # Create temp file in attachments dir (co-located with agent_func.py)
-        agent_func_mod = _get_agent_func_module()
-        if agent_func_mod and hasattr(agent_func_mod, 'ATTACHMENTS_DIR'):
-            attachments_dir = str(agent_func_mod.ATTACHMENTS_DIR)
-        else:
-            attachments_dir = "./attachments"
+        attachments_dir = str(file_system.get_attachments_dir())
         os.makedirs(attachments_dir, exist_ok=True)
         temp_path = os.path.join(attachments_dir, f".tmp_{msg_id}")
 
@@ -314,7 +326,6 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
         actual_sha = upload["hasher"].hexdigest()
 
         if expected_sha and actual_sha != expected_sha:
-            # Checksum mismatch — delete temp
             try:
                 os.unlink(upload["temp_path"])
             except OSError:
@@ -327,12 +338,7 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
             logging.error(f"[FileUpload] Checksum mismatch for {upload['file_name']}")
             return
 
-        # Rename temp -> final (use same resolved dir as start)
-        agent_func_fin = _get_agent_func_module()
-        if agent_func_fin and hasattr(agent_func_fin, 'ATTACHMENTS_DIR'):
-            final_dir = str(agent_func_fin.ATTACHMENTS_DIR)
-        else:
-            final_dir = "./attachments"
+        final_dir = str(file_system.get_attachments_dir())
         final_path = os.path.join(final_dir, upload["file_name"])
         try:
             os.replace(upload["temp_path"], final_path)
@@ -340,10 +346,7 @@ async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
             await ws.send(json.dumps({"id": msg_id, "status": "error", "error": str(e)}))
             return
 
-        # Invalidate cache
-        agent_func = _get_agent_func_module()
-        if agent_func:
-            agent_func._invalidate_cache()
+        file_system._invalidate_cache()
 
         logging.info(
             f"[FileUpload] COMPLETE {upload['file_name']} "
