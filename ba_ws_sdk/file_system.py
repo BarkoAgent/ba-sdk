@@ -91,7 +91,7 @@ def _scan_attachments() -> list:
         return []
     files = []
     for entry in sorted(_ATTACHMENTS_DIR.iterdir()):
-        if entry.is_file() and not entry.name.startswith(".tmp_"):
+        if entry.is_file() and not entry.name.startswith(".") and not entry.name.startswith("~"):
             stat = entry.stat()
             files.append({
                 "name": entry.name,
@@ -337,6 +337,25 @@ async def read_agent_file(
     })
 
 
+# ─── Lightweight change detection ────────────────────────────────────────────
+
+async def get_file_fingerprint(_run_test_id='1') -> str:
+    """
+    Returns a lightweight fingerprint of the attachments directory.
+    Used for cheap change detection without transferring full file metadata.
+    Returns JSON: {"count": N, "total_bytes": M}
+    """
+    if not _ATTACHMENTS_DIR.is_dir():
+        return json.dumps({"count": 0, "total_bytes": 0})
+    count = 0
+    total_bytes = 0
+    for entry in os.scandir(str(_ATTACHMENTS_DIR)):
+        if entry.is_file() and not entry.name.startswith(".") and not entry.name.startswith("~"):
+            count += 1
+            total_bytes += entry.stat().st_size
+    return json.dumps({"count": count, "total_bytes": total_bytes})
+
+
 # ─── Function registry (used by ws_core to inject into FUNCTION_MAP) ────────
 
 def get_agent_functions() -> dict:
@@ -348,6 +367,7 @@ def get_agent_functions() -> dict:
         "list_agent_files": list_agent_files,
         "delete_agent_file": delete_agent_file,
         "read_agent_file": read_agent_file,
+        "get_file_fingerprint": get_file_fingerprint,
     }
 
 

@@ -707,7 +707,11 @@ async def handle_and_send(message, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS):
 
 async def command_loop(ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     while True:
-        msg = await ws.recv()
+        try:
+            msg = await ws.recv()
+        except websockets.exceptions.ConnectionClosedOK:
+            logging.info("Command connection closed cleanly.")
+            return
         # Binary messages are file upload envelopes
         if isinstance(msg, bytes):
             try:
