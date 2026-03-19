@@ -10,7 +10,6 @@ import os
 import json
 import logging
 import base64
-import asyncio
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
