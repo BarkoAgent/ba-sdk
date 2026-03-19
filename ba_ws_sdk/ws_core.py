@@ -11,6 +11,12 @@ import struct
 import hashlib
 from . import streaming
 
+try:
+    from . import file_system
+except ImportError:
+    file_system = None          # SDK deployed without file_system.py — degrade gracefully
+    logging.warning("[SDK] file_system module not found — file management features disabled")
+
 from typing import Any, Optional
 
 
@@ -186,6 +192,14 @@ def _format_step_output(func_name: str, args: list, kwargs: dict, raw_result) ->
         if text is None and args:
             text = args[0]
         return f"exists_with_text text={_preview_value(text)}" if text is not None else "exists_with_text"
+    if func_name == "wait_for_download":
+        try:
+            parsed = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+            if isinstance(parsed, dict) and parsed.get("status") == "success":
+                return f"wait_for_download file={parsed.get('file_name')} size={parsed.get('size_bytes')}"
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return f"wait_for_download result={_preview_value(raw_result)}"
 
     raw_text = raw_result if isinstance(raw_result, str) else str(raw_result)
     if raw_text and raw_text.lower() not in ("success", "ok"):
@@ -207,11 +221,18 @@ def get_semaphore():
     return asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 def build_function_map(agent_func):
-    return {
+    func_map = {
         name: obj
         for name, obj in inspect.getmembers(agent_func, inspect.isfunction)
         if not name.startswith("_")
     }
+    # Merge SDK-provided file management functions (agent can override if needed)
+    if file_system is not None:
+        fs_funcs = file_system.get_agent_functions()
+        for name, func in fs_funcs.items():
+            if name not in func_map:
+                func_map[name] = func
+    return func_map
 
 def build_system_functions():
     return {
@@ -226,6 +247,168 @@ def _make_envelope(header: dict, payload_bytes: bytes) -> bytes:
     header_json = json.dumps(header, separators=(",", ":" )).encode("utf-8")
     header_len = len(header_json)
     return struct.pack(">I", header_len) + header_json + payload_bytes
+
+
+def _parse_envelope(data: bytes) -> tuple:
+    """Parse binary envelope: [4B header_len][header JSON][payload]."""
+    if len(data) < 4:
+        raise ValueError("Envelope too small")
+    header_len = struct.unpack(">I", data[:4])[0]
+    if len(data) < 4 + header_len:
+        raise ValueError("Incomplete envelope header")
+    header = json.loads(data[4:4 + header_len].decode("utf-8"))
+    payload = data[4 + header_len:]
+    return header, payload
+
+
+# ─── Chunked file upload state ──────────────────────────────────────────────
+_pending_uploads: dict = {}  # msg_id -> {file_name, total_size, temp_path, hasher, bytes_received, file_handle}
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))  # 100MB default
+
+
+def _cleanup_pending_uploads():
+    """Close file handles and remove temp files for all pending uploads."""
+    for msg_id, upload in list(_pending_uploads.items()):
+        try:
+            upload["file_handle"].close()
+        except Exception:
+            pass
+        try:
+            os.unlink(upload["temp_path"])
+        except OSError:
+            pass
+        logging.info(f"[FileUpload] Cleaned up stale upload {msg_id} ({upload['file_name']})")
+    _pending_uploads.clear()
+
+
+async def handle_file_upload_envelope(header: dict, payload: bytes, ws) -> None:
+    """
+    Process a file upload binary envelope (START / CHUNK / END).
+    Sends JSON text response on completion or error.
+    """
+    if file_system is None:
+        msg_id = header.get("id", "")
+        await ws.send(json.dumps({
+            "id": msg_id,
+            "status": "error",
+            "error": "File management not available — SDK file_system module is missing",
+        }))
+        return
+
+    msg_type = header.get("type", "")
+    msg_id = header.get("id", "")
+
+    if msg_type == "file_upload_start":
+        file_name = header.get("file_name", "")
+        total_size = header.get("total_size", 0)
+
+        try:
+            safe_name = file_system.sanitize_filename(file_name)
+        except ValueError as e:
+            await ws.send(json.dumps({"id": msg_id, "status": "error", "error": f"Invalid filename: {e}"}))
+            return
+
+        # Validate upload size
+        try:
+            total_size = int(total_size)
+        except (TypeError, ValueError):
+            total_size = 0
+        if total_size > MAX_UPLOAD_BYTES:
+            await ws.send(json.dumps({
+                "id": msg_id, "status": "error",
+                "error": f"File too large: {total_size} bytes exceeds limit of {MAX_UPLOAD_BYTES} bytes",
+            }))
+            return
+
+        attachments_dir = str(file_system.get_attachments_dir())
+        os.makedirs(attachments_dir, exist_ok=True)
+        temp_path = os.path.join(attachments_dir, f".tmp_{msg_id}")
+
+        _pending_uploads[msg_id] = {
+            "file_name": safe_name,
+            "total_size": total_size,
+            "temp_path": temp_path,
+            "hasher": hashlib.sha256(),
+            "bytes_received": 0,
+            "file_handle": open(temp_path, "wb"),
+        }
+        logging.info(f"[FileUpload] START {safe_name} (expected {total_size} bytes)")
+
+    elif msg_type == "file_upload_chunk":
+        upload = _pending_uploads.get(msg_id)
+        if not upload:
+            logging.warning(f"[FileUpload] CHUNK for unknown upload {msg_id}")
+            await ws.send(json.dumps({
+                "id": msg_id, "status": "error",
+                "error": "No pending upload for this id. Upload may have been cancelled or timed out.",
+            }))
+            return
+        # Enforce size limit even if total_size header was wrong/missing
+        if upload["bytes_received"] + len(payload) > MAX_UPLOAD_BYTES:
+            try:
+                upload["file_handle"].close()
+            except Exception:
+                pass
+            try:
+                os.unlink(upload["temp_path"])
+            except OSError:
+                pass
+            _pending_uploads.pop(msg_id, None)
+            await ws.send(json.dumps({
+                "id": msg_id, "status": "error",
+                "error": f"Upload exceeded size limit of {MAX_UPLOAD_BYTES} bytes",
+            }))
+            return
+        upload["file_handle"].write(payload)
+        upload["hasher"].update(payload)
+        upload["bytes_received"] += len(payload)
+
+    elif msg_type == "file_upload_end":
+        upload = _pending_uploads.pop(msg_id, None)
+        if not upload:
+            await ws.send(json.dumps({"id": msg_id, "status": "error", "error": "No pending upload"}))
+            return
+
+        try:
+            upload["file_handle"].close()
+        except Exception:
+            pass
+        expected_sha = header.get("sha256", "")
+        actual_sha = upload["hasher"].hexdigest()
+
+        if expected_sha and actual_sha != expected_sha:
+            try:
+                os.unlink(upload["temp_path"])
+            except OSError:
+                pass
+            await ws.send(json.dumps({
+                "id": msg_id,
+                "status": "error",
+                "error": f"Checksum mismatch: expected {expected_sha}, got {actual_sha}",
+            }))
+            logging.error(f"[FileUpload] Checksum mismatch for {upload['file_name']}")
+            return
+
+        final_dir = str(file_system.get_attachments_dir())
+        final_path = os.path.join(final_dir, upload["file_name"])
+        try:
+            os.replace(upload["temp_path"], final_path)
+        except OSError as e:
+            await ws.send(json.dumps({"id": msg_id, "status": "error", "error": str(e)}))
+            return
+
+        file_system._invalidate_cache()
+
+        logging.info(
+            f"[FileUpload] COMPLETE {upload['file_name']} "
+            f"({upload['bytes_received']} bytes, sha256={actual_sha[:12]}...)"
+        )
+        await ws.send(json.dumps({
+            "id": msg_id,
+            "status": "success",
+            "file_name": upload["file_name"],
+            "bytes_received": upload["bytes_received"],
+        }))
 
 async def stream_frames_direct(
     base_ws_uri,
@@ -460,7 +643,15 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
             for name, func in FUNCTION_MAP.items():
                 sig = inspect.signature(func)
                 arg_names = [p.name for p in sig.parameters.values() if p.name != "_run_test_id"]
-                method_details.append({"name": name, "args": arg_names, "doc": func.__doc__ or ""})
+                # Collect default values for optional parameters
+                defaults = {}
+                for p in sig.parameters.values():
+                    if p.name != "_run_test_id" and p.default is not inspect.Parameter.empty:
+                        defaults[p.name] = p.default
+                detail = {"name": name, "args": arg_names, "doc": func.__doc__ or ""}
+                if defaults:
+                    detail["defaults"] = defaults
+                method_details.append(detail)
             system_methods = [
                 {"name": name, "args": [], "doc": "[SYSTEM]"} 
                 for name in SYSTEM_FUNCTIONS.keys()
@@ -516,8 +707,24 @@ async def handle_and_send(message, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS):
 
 async def command_loop(ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     while True:
-        msg = await ws.recv()
-        asyncio.create_task(handle_and_send(msg, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS))
+        try:
+            msg = await ws.recv()
+        except websockets.exceptions.ConnectionClosedOK:
+            logging.info("Command connection closed cleanly.")
+            return
+        # Binary messages are file upload envelopes
+        if isinstance(msg, bytes):
+            try:
+                header, payload = _parse_envelope(msg)
+                msg_type = header.get("type", "")
+                if msg_type.startswith("file_upload_"):
+                    await handle_file_upload_envelope(header, payload, ws)
+                else:
+                    logging.warning(f"[WS] Unknown binary envelope type: {msg_type}")
+            except Exception as e:
+                logging.error(f"[WS] Error handling binary message: {e}")
+        else:
+            asyncio.create_task(handle_and_send(msg, ws, SEM, FUNCTION_MAP, SYSTEM_FUNCTIONS))
 
 def _build_uri(base_or_id: str) -> str:
     if base_or_id.startswith("ws://") or base_or_id.startswith("wss://"):
@@ -545,6 +752,8 @@ async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUN
                     task.cancel()
         except Exception as e:
             logging.error(f"Connection lost: {e}. Reconnecting in 5s...")
+        # Clean up any in-progress uploads (file handles + temp files)
+        _cleanup_pending_uploads()
         await asyncio.sleep(5)
 
 async def main_connect_ws(agent_func):
