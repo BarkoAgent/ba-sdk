@@ -763,6 +763,16 @@ async def main_connect_ws(agent_func):
     SYSTEM_FUNCTIONS = build_system_functions()
     from .streaming import get_latest_frame, get_active_capture_run_ids
 
+    enable_improvements = os.getenv("ENABLE_IMPROVEMENTS", "false").lower() in ("1", "true", "yes")
+    if enable_improvements:
+        from .improvements import ImprovementsManager
+        improvements_manager = ImprovementsManager(FUNCTION_MAP, agent_func)
+        improvements_manager.load()
+        FUNCTION_MAP["get_agent_source"]  = improvements_manager.get_agent_source
+        FUNCTION_MAP["add_improvement"]   = improvements_manager.add_improvement
+        FUNCTION_MAP["list_improvements"] = improvements_manager.list_improvements
+        logging.info("[Improvements] Self-improvement mode enabled.")
+
     raw_uri = os.getenv("BACKEND_WS_URI", "default_client_id")
     full_uri = _build_uri(raw_uri)
     conn_type = os.getenv("AGENT_CONNECTION_TYPE", "manager").lower()
