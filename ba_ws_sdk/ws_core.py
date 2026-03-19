@@ -748,7 +748,8 @@ async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUN
                         )
                     )
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-                for task in pending: task.cancel()
+                for task in pending:
+                    task.cancel()
         except Exception as e:
             logging.error(f"Connection lost: {e}. Reconnecting in 5s...")
         # Clean up any in-progress uploads (file handles + temp files)
