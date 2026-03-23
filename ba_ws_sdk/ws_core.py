@@ -4,12 +4,57 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 import websockets
 import os
 import struct
 import hashlib
 from . import streaming
+
+# ─── Step-output variable resolution ─────────────────────────────────────────
+# Syntax: {{step_output:N:REGEX}}
+# N is the 0-based index of the producer step inside the current bulk command
+# list; REGEX is applied to that step's raw output string. The first capture
+# group is used, or the full match if there are no groups.
+_STEP_OUTPUT_VAR_RE = re.compile(r'\{\{step_output:(\d+):(.+?)\}\}')
+
+
+def _resolve_step_output_var(value: str, step_outputs: list) -> str:
+    """Replace all {{step_output:N:REGEX}} tokens in *value* using *step_outputs*."""
+    if not isinstance(value, str) or "{{step_output:" not in value:
+        return value
+
+    def _replace(m):
+        idx = int(m.group(1))
+        pattern = m.group(2)
+        if idx >= len(step_outputs):
+            return m.group(0)  # not yet available — keep placeholder
+        try:
+            match = re.search(pattern, step_outputs[idx], re.DOTALL)
+            if match:
+                return match.group(1) if match.lastindex else match.group(0)
+        except re.error:
+            pass
+        return m.group(0)
+
+    return _STEP_OUTPUT_VAR_RE.sub(_replace, value)
+
+
+def _resolve_step_output_vars_in_command(args: list, kwargs: dict, step_outputs: list):
+    """Return (resolved_args, resolved_kwargs) with all {{step_output:…}} replaced."""
+    resolved_args = [_resolve_step_output_var(a, step_outputs) if isinstance(a, str) else a for a in args]
+    resolved_kwargs = {k: (_resolve_step_output_var(v, step_outputs) if isinstance(v, str) else v) for k, v in kwargs.items()}
+    return resolved_args, resolved_kwargs
+
+
+def _output_to_str(value) -> str:
+    """Coerce an agent return value to a plain string for step-output tracking."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
 
 try:
     from . import file_system
@@ -513,6 +558,10 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
     executed_lines = 0
     results = []
     driver_created_for = set()
+    # Track each step's raw output (as a string) so that subsequent steps can
+    # reference it via {{step_output:N:REGEX}} placeholders in their args/kwargs.
+    step_outputs: list = []
+    print(f"Executing macro with {len(commands)} commands, run_id={run_id}")
 
     try:
         for i, command in enumerate(commands):
@@ -520,6 +569,10 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
             args = command.get("args", []) or []
             kwargs = command.get("kwargs", {}) or {}
             command_run_id = kwargs.get("_run_test_id") or run_id
+
+            # Resolve {{step_output:N:REGEX}} placeholders before executing
+            if step_outputs:
+                args, kwargs = _resolve_step_output_vars_in_command(args, kwargs, step_outputs)
 
             if func_name == "create_driver":
                 driver_created_for.add(command_run_id)
@@ -565,6 +618,9 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
                 else:
                     output = raw_output if isinstance(raw_output, str) else str(raw_output)
                 results.append({"index": i, "function": func_name, "args": args, "kwargs": kwargs, "status": "success", "output": output, "raw_output": raw_output})
+                # Track raw output for {{step_output:N:REGEX}} resolution in later steps.
+                # Use the raw string form of the result (not the display-formatted output).
+                step_outputs.append(_output_to_str(raw_output))
             except Exception as e:
                 logging.error(f"[BulkExec] Step {i} ({func_name}) failed: {e}")
                 error_msg = str(e)
@@ -591,7 +647,9 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
                         element_hint=element_hint,
                         step_result=result,
                     )
+                    print(f"Captured frame for step {i} ({func_name})")  # Simple print to avoid logging issues in some environments
                 except Exception:
+                    print(f"Warning: Failed to capture frame for step {i} ({func_name})")  # Avoid logging module in case of setup issues
                     pass  # Non-fatal: recording is best-effort
 
         return {
