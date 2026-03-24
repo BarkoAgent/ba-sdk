@@ -11,6 +11,7 @@ import os
 import struct
 import hashlib
 from . import streaming
+from typing import Any, Optional
 
 # ─── Step-output variable resolution ─────────────────────────────────────────
 # Syntax: {{step_output:N:REGEX}}
@@ -62,7 +63,6 @@ except ImportError:
     file_system = None          # SDK deployed without file_system.py — degrade gracefully
     logging.warning("[SDK] file_system module not found — file management features disabled")
 
-from typing import Any, Optional
 
 
 def _is_sensitive_field(value: str) -> bool:
