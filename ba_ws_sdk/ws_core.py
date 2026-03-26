@@ -561,6 +561,7 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
     # Track each step's raw output (as a string) so that subsequent steps can
     # reference it via {{step_output:N:REGEX}} placeholders in their args/kwargs.
     step_outputs: list = []
+    execution_succeeded = False
     print(f"Executing macro with {len(commands)} commands, run_id={run_id}")
 
     try:
@@ -652,6 +653,7 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
                     print(f"Warning: Failed to capture frame for step {i} ({func_name})")  # Avoid logging module in case of setup issues
                     pass  # Non-fatal: recording is best-effort
 
+        execution_succeeded = True
         return {
             "status": "success",
             "executed_lines": executed_lines,
@@ -672,11 +674,16 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
             "results": results
         }
     finally:
-        if driver_created_for:
+        if not execution_succeeded and driver_created_for:
             for created_run_id in sorted(driver_created_for):
                 logging.info(
-                    f"[BulkExec] macro failure for ({created_run_id}) ."
+                    f"[BulkExec] Cleaning up driver for run_id ({created_run_id}) after macro failure."
                 )
+                if "stop_driver" in FUNCTION_MAP:
+                    try:
+                        await call_maybe_blocking(FUNCTION_MAP["stop_driver"], _run_test_id=created_run_id)
+                    except Exception as cleanup_err:
+                        logging.error(f"[BulkExec] Failed to stop driver for ({created_run_id}): {cleanup_err}")
     
 
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
