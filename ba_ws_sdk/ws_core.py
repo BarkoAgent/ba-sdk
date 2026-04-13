@@ -287,7 +287,7 @@ def build_function_map(agent_func):
                 func_map[name] = func
     # Merge a11y functions (drop-in, optional — skipped if a11y package absent)
     try:
-        import a11y_funcs as _a11y_funcs_mod
+        import a11y.a11y_funcs as _a11y_funcs_mod
         _a11y_funcs_mod.init(getattr(agent_func, "driver", {}))
         for name, func in _a11y_funcs_mod.get_agent_functions().items():
             if name not in func_map:
@@ -866,6 +866,16 @@ async def execute_macro_bulk_with_accessibility(
                     "results": results
                 })
 
+            # Capture URL before the call so we can detect click-triggered navigations.
+            pre_call_url = None
+            if config["policy"] == "after_navigation" and func_name not in _NAVIGATION_FUNCTIONS:
+                try:
+                    _pre_page = bindings["driver_store"].get(command_run_id, {}).get("page")
+                    if _pre_page is not None:
+                        pre_call_url = _pre_page.url
+                except Exception:
+                    pre_call_url = None
+
             try:
                 if "_run_test_id" not in kwargs:
                     kwargs = dict(kwargs)
@@ -932,8 +942,18 @@ async def execute_macro_bulk_with_accessibility(
                     print(f"Warning: Failed to capture frame for step {i} ({func_name})")
                     pass
 
-            if _bulk_should_checkpoint_after(config["policy"], config["checkpoint_steps"], command, step_index):
-                session, checkpoint = await _append_accessibility_checkpoint(bindings, session, command_run_id, config, step_label, step_index, checkpoint_kind=checkpoint_kind)
+            # Detect URL changes caused by clicks or other non-navigation functions.
+            url_changed = False
+            if pre_call_url is not None:
+                try:
+                    _post_page = bindings["driver_store"].get(command_run_id, {}).get("page")
+                    if _post_page is not None and _post_page.url != pre_call_url:
+                        url_changed = True
+                except Exception:
+                    pass
+
+            if _bulk_should_checkpoint_after(config["policy"], config["checkpoint_steps"], command, step_index) or url_changed:
+                session, checkpoint = await _append_accessibility_checkpoint(bindings, session, command_run_id, config, step_label, step_index, checkpoint_kind="navigation" if url_changed else checkpoint_kind)
                 if checkpoint and checkpoint.get("status") == "skipped" and session is not None:
                     session["execution_notes"].append(checkpoint["reason"])
 
@@ -970,7 +990,7 @@ async def execute_macro_bulk_with_accessibility(
         if driver_created_for:
             for created_run_id in sorted(driver_created_for):
                 logging.info(
-                    f"[BulkExec] macro failure for ({created_run_id}) ."
+                    f"[BulkExec] macro completed with open driver ({created_run_id})."
                 )
 
 async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "1") -> dict:
@@ -1094,7 +1114,7 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
         if driver_created_for:
             for created_run_id in sorted(driver_created_for):
                 logging.info(
-                    f"[BulkExec] macro failure for ({created_run_id}) ."
+                    f"[BulkExec] macro completed with open driver ({created_run_id})."
                 )
     
 
