@@ -34,7 +34,7 @@ def _parse_version(v: str) -> tuple:
 
 def _get_installed_sdk_version() -> str | None:
     try:
-        from importlib.metadata import version as pkg_version, PackageNotFoundError
+        from importlib.metadata import version as pkg_version
         return pkg_version(_SDK_PACKAGE_NAME)
     except Exception:
         return None
