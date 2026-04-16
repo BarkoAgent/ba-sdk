@@ -816,6 +816,10 @@ async def connect_to_backend(uri, connection_type, SEM, FUNCTION_MAP, SYSTEM_FUN
 
 async def main_connect_ws(agent_func):
     setup_logging()
+
+    from .version_checker import run_version_checks
+    await asyncio.get_event_loop().run_in_executor(None, run_version_checks)
+
     SEM = get_semaphore()
     FUNCTION_MAP = build_function_map(agent_func)
     SYSTEM_FUNCTIONS = build_system_functions()
