@@ -11,6 +11,13 @@ import os
 import struct
 import hashlib
 from . import streaming
+from .a11y_adapter import (
+    _A11Y_FUNCTION_NAMES,
+    _A11Y_TIMEOUT_S,
+    CoreOps,
+    execute_macro_bulk_with_accessibility,
+    register_agent_module,
+)
 from typing import Any, Optional
 
 # ─── Step-output variable resolution ─────────────────────────────────────────
@@ -62,7 +69,6 @@ try:
 except ImportError:
     file_system = None          # SDK deployed without file_system.py — degrade gracefully
     logging.warning("[SDK] file_system module not found — file management features disabled")
-
 
 
 def _is_sensitive_field(value: str) -> bool:
@@ -277,6 +283,15 @@ def build_function_map(agent_func):
         for name, func in fs_funcs.items():
             if name not in func_map:
                 func_map[name] = func
+    # Merge a11y functions (drop-in, optional — skipped if a11y package absent)
+    try:
+        import a11y.a11y_funcs as _a11y_funcs_mod
+        _a11y_funcs_mod.init(getattr(agent_func, "driver", {}))
+        for name, func in _a11y_funcs_mod.get_agent_functions().items():
+            if name not in func_map:
+                func_map[name] = func
+    except ImportError:
+        pass
     return func_map
 
 def build_system_functions():
@@ -554,6 +569,7 @@ async def call_maybe_blocking(func, *args, **kwargs):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
 
+
 async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "1") -> dict:
     executed_lines = 0
     results = []
@@ -675,7 +691,7 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
         if driver_created_for:
             for created_run_id in sorted(driver_created_for):
                 logging.info(
-                    f"[BulkExec] macro failure for ({created_run_id}) ."
+                    f"[BulkExec] macro completed with open driver ({created_run_id})."
                 )
     
 
@@ -724,7 +740,23 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
         if function_name == "execute_macro_bulk":
             commands = args[0] if args else kwargs.get("commands", [])
             _run_test_id = kwargs.get("_run_test_id") or message_id
-            result = await execute_macro_bulk(commands, FUNCTION_MAP, run_id=_run_test_id)
+            accessibility = kwargs.get("accessibility") or kwargs.get("a11y")
+            core_ops = CoreOps(
+                execute_macro_bulk=execute_macro_bulk,
+                call_maybe_blocking=call_maybe_blocking,
+                resolve_step_output_vars=_resolve_step_output_vars_in_command,
+                extract_element_hint=_extract_element_hint,
+                format_step_output=_format_step_output,
+                output_to_str=_output_to_str,
+                capture_step_frame=streaming.capture_step_frame_async,
+            )
+            result = await execute_macro_bulk_with_accessibility(
+                commands,
+                FUNCTION_MAP,
+                core_ops,
+                run_id=_run_test_id,
+                accessibility=accessibility,
+            )
             response_dict.update(result)
             return json.dumps(response_dict)
 
@@ -744,7 +776,11 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
             if "_run_test_id" in sig.parameters and "_run_test_id" not in kwargs:
                 kwargs = dict(kwargs)
                 kwargs["_run_test_id"] = message_id
-            result = await call_maybe_blocking(FUNCTION_MAP[function_name], *args, **kwargs)
+            coro = call_maybe_blocking(FUNCTION_MAP[function_name], *args, **kwargs)
+            if function_name in _A11Y_FUNCTION_NAMES:
+                result = await asyncio.wait_for(coro, timeout=_A11Y_TIMEOUT_S)
+            else:
+                result = await coro
             response_dict.update({"status": "success", "result": result})
         else:
             response_dict.update({"status": "error", "error": f"Unknown function: {function_name}"})
@@ -820,6 +856,7 @@ async def main_connect_ws(agent_func):
     from .version_checker import run_version_checks
     await asyncio.get_event_loop().run_in_executor(None, run_version_checks)
 
+    register_agent_module(agent_func)
     SEM = get_semaphore()
     FUNCTION_MAP = build_function_map(agent_func)
     SYSTEM_FUNCTIONS = build_system_functions()
