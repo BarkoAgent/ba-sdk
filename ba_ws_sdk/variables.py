@@ -72,7 +72,30 @@ def get_all(run_id: str) -> dict:
         return dict(_variables.get(run_id, {}))
 
 
+def get_exported_variables(_run_test_id: str = "1") -> dict:
+    """
+    RPC-callable: return variables exported by this run (saved by export_run at stop_driver).
+    Called by the backend after stop_driver to capture variables for dependent tests.
+    """
+    with _lock:
+        return dict(_exported.get(_run_test_id, {}))
+
+
+def import_variables(variables: dict, _run_test_id: str = "1") -> str:
+    """
+    RPC-callable: pre-populate variables from a dependency test's exports.
+    Called as a preamble step before the dependent test's own steps run.
+    """
+    with _lock:
+        if _run_test_id not in _variables:
+            _variables[_run_test_id] = {}
+        _variables[_run_test_id].update(variables)
+    logging.info(f"[Variables] Imported {len(variables)} variable(s) into run_id={_run_test_id}: {list(variables.keys())}")
+    return f"imported {len(variables)} variable(s)"
+
+
 def cleanup_run(run_id: str) -> None:
     """Remove variable state for a finished run."""
     with _lock:
         _variables.pop(run_id, None)
+        _exported.pop(run_id, None)
