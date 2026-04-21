@@ -6,3 +6,8 @@ try:
 except ImportError:
     file_system = None
 
+try:
+    from . import variables
+except ImportError:
+    variables = None
+
