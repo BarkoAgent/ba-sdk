@@ -467,7 +467,11 @@ def _capture_step_frame_selenium(
     element_hint: Optional[dict] = None,
     step_result: Any = None,
 ) -> None:
-    png_bytes = selenium_driver.get_screenshot_as_png()
+    from selenium.common.exceptions import UnexpectedAlertPresentException
+    try:
+        png_bytes = selenium_driver.get_screenshot_as_png()
+    except UnexpectedAlertPresentException:
+        return
     bbox = None
     dpr = 1.0
     if ENABLE_ELEMENT_BBOX:
