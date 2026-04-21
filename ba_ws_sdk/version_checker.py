@@ -175,16 +175,18 @@ def run_version_checks() -> None:
     """
     Run SDK and agent version checks at startup.
 
-    Call once before the WebSocket event loop begins.  If any update is
-    applied the process restarts automatically via os.execv.
+    Step 1: check ba-sdk, prompt, update if confirmed.
+    Step 2: check agent repo, prompt, update if confirmed.
+    Restart once at the end if anything was updated.
     """
-    # Guard: skip if we already restarted once this session to prevent loops.
     if os.environ.get(_UPDATED_ENV_VAR) == "1":
         logging.info("[VersionChecker] Post-update restart detected — skipping checks.")
         return
 
+    print("[VersionChecker] --- Step 1/2: Checking ba-sdk ---")
     sdk_updated = _check_sdk()
 
+    print("[VersionChecker] --- Step 2/2: Checking agent repo ---")
     agent_dir = _get_agent_git_root()
     agent_updated = _check_agent(agent_dir) if agent_dir else False
 
