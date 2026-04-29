@@ -84,13 +84,18 @@ def sanitize_filename(name: str) -> str:
 
 # ─── Internal helpers ────────────────────────────────────────────────────────
 
+_PARTIAL_DOWNLOAD_SUFFIXES = {".crdownload", ".part", ".download"}
+
 def _scan_attachments() -> list:
     """Scan attachments dir and return file metadata."""
     if not _ATTACHMENTS_DIR.is_dir():
         return []
     files = []
     for entry in sorted(_ATTACHMENTS_DIR.iterdir()):
-        if entry.is_file() and not entry.name.startswith(".") and not entry.name.startswith("~"):
+        if (entry.is_file()
+                and not entry.name.startswith(".")
+                and not entry.name.startswith("~")
+                and not any(entry.name.endswith(s) for s in _PARTIAL_DOWNLOAD_SUFFIXES)):
             stat = entry.stat()
             files.append({
                 "name": entry.name,

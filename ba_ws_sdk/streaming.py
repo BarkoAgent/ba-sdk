@@ -467,7 +467,11 @@ def _capture_step_frame_selenium(
     element_hint: Optional[dict] = None,
     step_result: Any = None,
 ) -> None:
-    png_bytes = selenium_driver.get_screenshot_as_png()
+    from selenium.common.exceptions import UnexpectedAlertPresentException
+    try:
+        png_bytes = selenium_driver.get_screenshot_as_png()
+    except UnexpectedAlertPresentException:
+        return
     bbox = None
     dpr = 1.0
     if ENABLE_ELEMENT_BBOX:
@@ -594,6 +598,120 @@ def capture_step_frame(
             step_result=step_result,
         )
     )
+
+
+def capture_step_frame_sync(
+    run_id: str,
+    func_name: str = None,
+    element_hint: Optional[dict] = None,
+    step_index: int = None,
+    step_result: Any = None,
+) -> None:
+    with _LOCK:
+        if run_id not in _RECORDING_FLAGS:
+            return
+        driver = _CAPTURE_DRIVERS.get(run_id)
+        if driver is None:
+            return
+    selenium_driver = _get_selenium_driver(driver)
+    if selenium_driver is None:
+        logging.debug(f"[StepCapture] capture_step_frame_sync: no Selenium driver for run_id={run_id}")
+        return
+    try:
+        _capture_step_frame_selenium(
+            run_id=run_id,
+            selenium_driver=selenium_driver,
+            step_index=step_index,
+            func_name=func_name,
+            element_hint=element_hint,
+            step_result=step_result,
+        )
+    except Exception as exc:
+        logging.warning(f"[StepCapture] capture_step_frame_sync failed ({func_name}): {exc}")
+
+
+def drop_recent_timer_frames(run_id: str, within_seconds: float = 1.5) -> None:
+    cutoff = time.time() - within_seconds
+    removed = 0
+    with _LOCK:
+        frames = _RECORDED_FRAMES.get(run_id)
+        if not frames:
+            return
+
+        while frames and frames[-1].get("trigger") == "timer" and frames[-1]["timestamp"] >= cutoff:
+            frames.pop()
+            removed += 1
+
+        step_idx = None
+        for i in range(len(frames) - 1, -1, -1):
+            if frames[i].get("trigger") == "step":
+                step_idx = i
+                break
+        if step_idx is not None and step_idx > 0:
+            to_remove = []
+            i = step_idx - 1
+            while i >= 0 and frames[i].get("trigger") == "timer" and frames[i]["timestamp"] >= cutoff:
+                to_remove.append(i)
+                i -= 1
+            for idx in sorted(to_remove, reverse=True):
+                frames.pop(idx)
+            removed += len(to_remove)
+
+    if removed:
+        logging.debug(f"[StepCapture] Dropped {removed} recent timer frame(s) for {run_id} to prevent duplicate")
+
+
+async def capture_error_frame_async(run_id: str, func_name: str) -> None:
+    recording_active = run_id in _RECORDING_FLAGS
+    logging.info(
+        f"[ErrorCapture] {func_name} failed — capturing error screenshot "
+        f"(run_id={run_id}, recording_active={recording_active})"
+    )
+    try:
+        if not recording_active:
+            logging.warning(
+                f"[ErrorCapture] Recording not active for {run_id}; "
+                "activating it so the error frame can be stored."
+            )
+            start_recording(run_id)
+        await capture_step_frame_async(
+            run_id=run_id,
+            func_name=f"{func_name} (error)",
+            element_hint=None,
+        )
+        logging.info(f"[ErrorCapture] Error screenshot stored for {func_name}")
+    except Exception as exc:
+        logging.warning(f"[ErrorCapture] Error screenshot failed for {func_name}: {exc}")
+
+
+def capture_error_frame(run_id: str, func_name: str) -> None:
+    recording_active = run_id in _RECORDING_FLAGS
+    logging.info(
+        f"[ErrorCapture] {func_name} failed — capturing error screenshot "
+        f"(run_id={run_id}, recording_active={recording_active})"
+    )
+    try:
+        if not recording_active:
+            logging.warning(
+                f"[ErrorCapture] Recording not active for {run_id}; "
+                "activating it so the error frame can be stored."
+            )
+            start_recording(run_id)
+        driver_obj = _CAPTURE_DRIVERS.get(run_id)
+        if driver_obj is None:
+            return
+        selenium_driver = _get_selenium_driver(driver_obj)
+        if selenium_driver is None:
+            return
+        _capture_step_frame_selenium(
+            run_id=run_id,
+            selenium_driver=selenium_driver,
+            func_name=f"{func_name} (error)",
+            element_hint=None,
+        )
+        logging.info(f"[ErrorCapture] Error screenshot stored for {func_name}")
+    except Exception as exc:
+        logging.warning(f"[ErrorCapture] Error screenshot failed for {func_name}: {exc}")
 
 
 def _stream_worker(run_id: str, driver, fps: float, jpeg_quality: int, stop_event: threading.Event, stop_timeout: Optional[float] = None):
