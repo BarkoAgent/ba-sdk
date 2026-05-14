@@ -1001,6 +1001,11 @@ async def _astream_worker(
                 logging.info(f"[{run_id}] stop_after reached ({stop_after}s). Exiting worker.")
                 return
 
+            updated_page = _get_playwright_page(driver)
+            if updated_page is not None and updated_page is not page:
+                logging.info(f"[{run_id}] Driver page changed, switching stream to new page.")
+                page = updated_page
+
             if hasattr(page, "is_closed"):
                 try:
                     if page.is_closed():
