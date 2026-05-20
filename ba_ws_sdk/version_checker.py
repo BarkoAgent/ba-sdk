@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import urllib.request
+from typing import Optional
 
 _SDK_PYPROJECT_URL = (
     "https://raw.githubusercontent.com/BarkoAgent/ba-sdk/main/pyproject.toml"
@@ -32,7 +33,7 @@ def _parse_version(v: str) -> tuple:
         return (0,)
 
 
-def _get_installed_sdk_version() -> str | None:
+def _get_installed_sdk_version() -> Optional[str]:
     try:
         from importlib.metadata import version as pkg_version
         return pkg_version(_SDK_PACKAGE_NAME)
@@ -40,7 +41,7 @@ def _get_installed_sdk_version() -> str | None:
         return None
 
 
-def _get_remote_sdk_version() -> str | None:
+def _get_remote_sdk_version() -> Optional[str]:
     try:
         req = urllib.request.Request(
             _SDK_PYPROJECT_URL,
@@ -57,7 +58,7 @@ def _get_remote_sdk_version() -> str | None:
     return None
 
 
-def _get_agent_git_root() -> str | None:
+def _get_agent_git_root() -> Optional[str]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
