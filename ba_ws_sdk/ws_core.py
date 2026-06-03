@@ -711,6 +711,39 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
                 )
     
 
+# Timeout (seconds) applied to single, ad-hoc tool calls. Batch executions keep
+# the agent's configured default timeout instead.
+SINGLE_CALL_TIMEOUT_S = int(os.getenv("SINGLE_CALL_TIMEOUT_S", "5"))
+
+
+def _agent_module(FUNCTION_MAP):
+    """Resolve the agent module that owns the tool functions (best-effort)."""
+    fn = FUNCTION_MAP.get("create_driver") or next(iter(FUNCTION_MAP.values()), None)
+    return inspect.getmodule(fn) if fn is not None else None
+
+
+def _apply_run_timeout(FUNCTION_MAP, run_id, *, bulk):
+    """
+    Set the agent's per-run action timeout for this execution:
+      - bulk=True  -> the agent's configured default (DEFAULT_TIMEOUT)
+      - bulk=False -> SINGLE_CALL_TIMEOUT_S (single ad-hoc tool calls fail fast)
+
+    No-op for agent modules that don't expose `test_timeout` (e.g. non-Playwright
+    agents), so the SDK stays generic.
+    """
+    try:
+        mod = _agent_module(FUNCTION_MAP)
+        test_timeout = getattr(mod, "test_timeout", None)
+        if not isinstance(test_timeout, dict):
+            return
+        if bulk:
+            test_timeout[run_id] = int(getattr(mod, "DEFAULT_TIMEOUT", SINGLE_CALL_TIMEOUT_S))
+        else:
+            test_timeout[run_id] = SINGLE_CALL_TIMEOUT_S
+    except Exception:
+        logging.debug("Could not apply run timeout", exc_info=True)
+
+
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     response_dict = {}
     message_id = None
@@ -756,6 +789,8 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
         if function_name == "execute_macro_bulk":
             commands = args[0] if args else kwargs.get("commands", [])
             _run_test_id = kwargs.get("_run_test_id") or message_id
+            # Batch execution uses the agent's configured default timeout.
+            _apply_run_timeout(FUNCTION_MAP, _run_test_id, bulk=True)
             accessibility = kwargs.get("accessibility") or kwargs.get("a11y")
             core_ops = CoreOps(
                 execute_macro_bulk=execute_macro_bulk,
@@ -792,6 +827,8 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
             if "_run_test_id" in sig.parameters and "_run_test_id" not in kwargs:
                 kwargs = dict(kwargs)
                 kwargs["_run_test_id"] = message_id
+            # Single, ad-hoc tool call -> fail fast on the short timeout.
+            _apply_run_timeout(FUNCTION_MAP, message_id, bulk=False)
             coro = call_maybe_blocking(FUNCTION_MAP[function_name], *args, **kwargs)
             if function_name in _A11Y_FUNCTION_NAMES:
                 result = await asyncio.wait_for(coro, timeout=_A11Y_TIMEOUT_S)
