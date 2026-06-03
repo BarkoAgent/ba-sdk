@@ -479,14 +479,20 @@ async def stream_frames_direct(
     retry_delay=5.0,
 ):
     stream_uri = base_ws_uri + stream_socket_id + "-stream"
-    last_hash_by_run = {}
-    last_sent_ts_by_run = {}
-    logging.info(f"[Direct] Starting dedicated stream loop to: {stream_uri}")
+    # Resend the latest frame at least this often even if it hasn't changed, so a
+    # visually static screen (common at startup) never crosses the viewer's stale
+    # threshold (~20s) and gets falsely flagged as "stalled".
+    keepalive = float(os.getenv("STREAM_KEEPALIVE_S", "5.0"))
+    logging.info(f"[Direct] Starting dedicated stream loop to: {stream_uri} (keepalive={keepalive}s)")
 
     while True:
         try:
             async with websockets.connect(stream_uri) as ws:
                 logging.info(f"[Direct] Connected to streaming endpoint: {stream_uri}")
+                # Reset dedup per connection so a freshly (re)connected viewer
+                # immediately receives the current frame instead of waiting for a change.
+                last_hash_by_run = {}
+                last_sent_ts_by_run = {}
                 while True:
                     try:
                         run_ids = await asyncio.get_running_loop().run_in_executor(
@@ -506,9 +512,10 @@ async def stream_frames_direct(
                         now = time.time()
                         if frame_bytes:
                             h = hashlib.sha256(frame_bytes).hexdigest()
-                            if h != last_hash_by_run.get(run_id):
-                                seq = int(last_sent_ts_by_run.get(run_id) or now)
-                                header = {"id": run_id, "type": "screenshot", "seq": seq}
+                            changed = h != last_hash_by_run.get(run_id)
+                            stale = (now - last_sent_ts_by_run.get(run_id, 0.0)) >= keepalive
+                            if changed or stale:
+                                header = {"id": run_id, "type": "screenshot", "seq": int(now * 1000)}
                                 envelope = _make_envelope(header, frame_bytes)
                                 await ws.send(envelope)
                                 last_hash_by_run[run_id] = h
@@ -523,7 +530,11 @@ async def stream_frames_direct(
 
 async def stream_frames_multiplex(ws, get_latest_frame, get_active_capture_run_ids, interval=1.0):
     last_hash_by_run = {}
-    logging.info("[Manager] Starting multiplexed stream for active run_ids")
+    last_sent_ts_by_run = {}
+    # Resend an unchanged frame at least this often so a static screen doesn't get
+    # falsely flagged as "stalled" by the viewer's stale-frame watchdog.
+    keepalive = float(os.getenv("STREAM_KEEPALIVE_S", "5.0"))
+    logging.info(f"[Manager] Starting multiplexed stream for active run_ids (keepalive={keepalive}s)")
 
     while True:
         try:
@@ -543,18 +554,23 @@ async def stream_frames_multiplex(ws, get_latest_frame, get_active_capture_run_i
                     frame = None
                 if not frame:
                     continue
+                now = time.time()
                 h = hashlib.sha256(frame).hexdigest()
-                if h != last_hash_by_run.get(run_id):
-                    header = {"id": run_id, "type": "screenshot", "seq": int(time.time())}
+                changed = h != last_hash_by_run.get(run_id)
+                stale = (now - last_sent_ts_by_run.get(run_id, 0.0)) >= keepalive
+                if changed or stale:
+                    header = {"id": run_id, "type": "screenshot", "seq": int(now * 1000)}
                     envelope = _make_envelope(header, frame)
                     await ws.send(envelope)
                     last_hash_by_run[run_id] = h
+                    last_sent_ts_by_run[run_id] = now
 
             # Cleanup stale hash entries
             active = set(run_ids)
-            for stale in list(last_hash_by_run.keys()):
-                if stale not in active:
-                    last_hash_by_run.pop(stale, None)
+            for stale_run in list(last_hash_by_run.keys()):
+                if stale_run not in active:
+                    last_hash_by_run.pop(stale_run, None)
+                    last_sent_ts_by_run.pop(stale_run, None)
             await asyncio.sleep(interval)
         except websockets.exceptions.ConnectionClosed:
             logging.warning("[Manager] WebSocket closed, stopping multiplex stream task.")
