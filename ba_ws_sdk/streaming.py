@@ -1093,6 +1093,21 @@ async def _clear_frame_recording(_run_test_id='1') -> str:
     return "recording cleared"
 
 
+async def _get_latest_frame_b64(_run_test_id='1') -> str:
+    """
+    [SYSTEM] Returns the latest live-stream frame as a base64-encoded JPEG string.
+    Not exposed to users - called by backend only (vision agent loop).
+
+    This is a thin wrapper around get_latest_frame() that serialises the bytes
+    for transport over the WebSocket JSON protocol.  Returns an empty string if
+    no frame is available yet (driver not started or stream not running).
+    """
+    frame_bytes = await asyncio.to_thread(get_latest_frame, _run_test_id)
+    if frame_bytes is None:
+        return ""
+    return base64.b64encode(frame_bytes).decode("utf-8")
+
+
 async def _astream_worker(
     run_id: str,
     driver,
@@ -1152,8 +1167,13 @@ async def _astream_worker(
                 if _is_target_closed_error(exc):
                     logging.info(f"[{run_id}] Target closed while capturing screenshot. Exiting worker.")
                     return
-                logging.exception(f"[{run_id}] Failed to capture screenshot; stopping worker.")
-                return
+                # Transient screenshot failures (e.g. "Protocol error
+                # (Page.captureScreenshot): Unable to capture screenshot" during a
+                # navigation/heavy render) must NOT kill the stream — skip this
+                # frame and keep going, otherwise one hiccup stalls the whole run.
+                logging.warning(f"[{run_id}] Screenshot failed ({exc}); skipping frame and continuing.")
+                await asyncio.sleep(interval)
+                continue
 
             # convert to jpeg (with fallback to original bytes on failure)
             try:

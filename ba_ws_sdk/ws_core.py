@@ -301,6 +301,9 @@ def build_system_functions():
         "_get_recorded_frames": streaming._get_recorded_frames,
         "_ack_recorded_frames": streaming._ack_recorded_frames,
         "_clear_frame_recording": streaming._clear_frame_recording,
+        # Vision agent: fetch the latest live-stream frame as base64 without
+        # recording it as a test step.
+        "_get_latest_frame_b64": streaming._get_latest_frame_b64,
     }
 
 def _make_envelope(header: dict, payload_bytes: bytes) -> bytes:
