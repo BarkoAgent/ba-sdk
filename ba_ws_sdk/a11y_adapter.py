@@ -130,6 +130,7 @@ def _normalize_accessibility_config(raw_config: Any) -> dict:
         "policy": policy,
         "checkpoint_steps": checkpoint_steps,
         "audit_name": str(config.get("audit_name") or "Bulk accessibility audit"),
+        "project_id": str(config.get("project_id") or ""),
         "standard_profile": str(config.get("standard_profile") or "wcag22aa"),
         "scope_selector": str(config.get("scope_selector") or ""),
         "include_best_practices": "true" if _parse_boolish(config.get("include_best_practices"), True) else "false",
@@ -244,6 +245,7 @@ def _ensure_accessibility_session(bindings: dict, run_id: str, config: dict, exi
         axe_result_types=config["axe_result_types"],
         axe_reporter=config["axe_reporter"],
         _run_test_id=run_id,
+        project_id=config["project_id"],
     )
     return session, None
 
