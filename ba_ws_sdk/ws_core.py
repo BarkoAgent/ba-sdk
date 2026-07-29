@@ -301,6 +301,9 @@ def build_system_functions():
         "_get_recorded_frames": streaming._get_recorded_frames,
         "_ack_recorded_frames": streaming._ack_recorded_frames,
         "_clear_frame_recording": streaming._clear_frame_recording,
+        # Vision agent: fetch the latest live-stream frame as base64 without
+        # recording it as a test step.
+        "_get_latest_frame_b64": streaming._get_latest_frame_b64,
     }
 
 def _make_envelope(header: dict, payload_bytes: bytes) -> bytes:
@@ -479,14 +482,20 @@ async def stream_frames_direct(
     retry_delay=5.0,
 ):
     stream_uri = base_ws_uri + stream_socket_id + "-stream"
-    last_hash_by_run = {}
-    last_sent_ts_by_run = {}
-    logging.info(f"[Direct] Starting dedicated stream loop to: {stream_uri}")
+    # Resend the latest frame at least this often even if it hasn't changed, so a
+    # visually static screen (common at startup) never crosses the viewer's stale
+    # threshold (~20s) and gets falsely flagged as "stalled".
+    keepalive = float(os.getenv("STREAM_KEEPALIVE_S", "5.0"))
+    logging.info(f"[Direct] Starting dedicated stream loop to: {stream_uri} (keepalive={keepalive}s)")
 
     while True:
         try:
             async with websockets.connect(stream_uri) as ws:
                 logging.info(f"[Direct] Connected to streaming endpoint: {stream_uri}")
+                # Reset dedup per connection so a freshly (re)connected viewer
+                # immediately receives the current frame instead of waiting for a change.
+                last_hash_by_run = {}
+                last_sent_ts_by_run = {}
                 while True:
                     try:
                         run_ids = await asyncio.get_running_loop().run_in_executor(
@@ -506,9 +515,10 @@ async def stream_frames_direct(
                         now = time.time()
                         if frame_bytes:
                             h = hashlib.sha256(frame_bytes).hexdigest()
-                            if h != last_hash_by_run.get(run_id):
-                                seq = int(last_sent_ts_by_run.get(run_id) or now)
-                                header = {"id": run_id, "type": "screenshot", "seq": seq}
+                            changed = h != last_hash_by_run.get(run_id)
+                            stale = (now - last_sent_ts_by_run.get(run_id, 0.0)) >= keepalive
+                            if changed or stale:
+                                header = {"id": run_id, "type": "screenshot", "seq": int(now * 1000)}
                                 envelope = _make_envelope(header, frame_bytes)
                                 await ws.send(envelope)
                                 last_hash_by_run[run_id] = h
@@ -523,7 +533,11 @@ async def stream_frames_direct(
 
 async def stream_frames_multiplex(ws, get_latest_frame, get_active_capture_run_ids, interval=1.0):
     last_hash_by_run = {}
-    logging.info("[Manager] Starting multiplexed stream for active run_ids")
+    last_sent_ts_by_run = {}
+    # Resend an unchanged frame at least this often so a static screen doesn't get
+    # falsely flagged as "stalled" by the viewer's stale-frame watchdog.
+    keepalive = float(os.getenv("STREAM_KEEPALIVE_S", "5.0"))
+    logging.info(f"[Manager] Starting multiplexed stream for active run_ids (keepalive={keepalive}s)")
 
     while True:
         try:
@@ -543,18 +557,23 @@ async def stream_frames_multiplex(ws, get_latest_frame, get_active_capture_run_i
                     frame = None
                 if not frame:
                     continue
+                now = time.time()
                 h = hashlib.sha256(frame).hexdigest()
-                if h != last_hash_by_run.get(run_id):
-                    header = {"id": run_id, "type": "screenshot", "seq": int(time.time())}
+                changed = h != last_hash_by_run.get(run_id)
+                stale = (now - last_sent_ts_by_run.get(run_id, 0.0)) >= keepalive
+                if changed or stale:
+                    header = {"id": run_id, "type": "screenshot", "seq": int(now * 1000)}
                     envelope = _make_envelope(header, frame)
                     await ws.send(envelope)
                     last_hash_by_run[run_id] = h
+                    last_sent_ts_by_run[run_id] = now
 
             # Cleanup stale hash entries
             active = set(run_ids)
-            for stale in list(last_hash_by_run.keys()):
-                if stale not in active:
-                    last_hash_by_run.pop(stale, None)
+            for stale_run in list(last_hash_by_run.keys()):
+                if stale_run not in active:
+                    last_hash_by_run.pop(stale_run, None)
+                    last_sent_ts_by_run.pop(stale_run, None)
             await asyncio.sleep(interval)
         except websockets.exceptions.ConnectionClosed:
             logging.warning("[Manager] WebSocket closed, stopping multiplex stream task.")
@@ -695,6 +714,39 @@ async def execute_macro_bulk(commands: list, FUNCTION_MAP: dict, run_id: str = "
                 )
     
 
+# Timeout (seconds) applied to single, ad-hoc tool calls. Batch executions keep
+# the agent's configured default timeout instead.
+SINGLE_CALL_TIMEOUT_S = int(os.getenv("SINGLE_CALL_TIMEOUT_S", "5"))
+
+
+def _agent_module(FUNCTION_MAP):
+    """Resolve the agent module that owns the tool functions (best-effort)."""
+    fn = FUNCTION_MAP.get("create_driver") or next(iter(FUNCTION_MAP.values()), None)
+    return inspect.getmodule(fn) if fn is not None else None
+
+
+def _apply_run_timeout(FUNCTION_MAP, run_id, *, bulk):
+    """
+    Set the agent's per-run action timeout for this execution:
+      - bulk=True  -> the agent's configured default (DEFAULT_TIMEOUT)
+      - bulk=False -> SINGLE_CALL_TIMEOUT_S (single ad-hoc tool calls fail fast)
+
+    No-op for agent modules that don't expose `test_timeout` (e.g. non-Playwright
+    agents), so the SDK stays generic.
+    """
+    try:
+        mod = _agent_module(FUNCTION_MAP)
+        test_timeout = getattr(mod, "test_timeout", None)
+        if not isinstance(test_timeout, dict):
+            return
+        if bulk:
+            test_timeout[run_id] = int(getattr(mod, "DEFAULT_TIMEOUT", SINGLE_CALL_TIMEOUT_S))
+        else:
+            test_timeout[run_id] = SINGLE_CALL_TIMEOUT_S
+    except Exception:
+        logging.debug("Could not apply run timeout", exc_info=True)
+
+
 async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
     response_dict = {}
     message_id = None
@@ -740,6 +792,8 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
         if function_name == "execute_macro_bulk":
             commands = args[0] if args else kwargs.get("commands", [])
             _run_test_id = kwargs.get("_run_test_id") or message_id
+            # Batch execution uses the agent's configured default timeout.
+            _apply_run_timeout(FUNCTION_MAP, _run_test_id, bulk=True)
             accessibility = kwargs.get("accessibility") or kwargs.get("a11y")
             core_ops = CoreOps(
                 execute_macro_bulk=execute_macro_bulk,
@@ -776,6 +830,8 @@ async def handle_message(message, FUNCTION_MAP, SYSTEM_FUNCTIONS):
             if "_run_test_id" in sig.parameters and "_run_test_id" not in kwargs:
                 kwargs = dict(kwargs)
                 kwargs["_run_test_id"] = message_id
+            # Single, ad-hoc tool call -> fail fast on the short timeout.
+            _apply_run_timeout(FUNCTION_MAP, message_id, bulk=False)
             coro = call_maybe_blocking(FUNCTION_MAP[function_name], *args, **kwargs)
             if function_name in _A11Y_FUNCTION_NAMES:
                 result = await asyncio.wait_for(coro, timeout=_A11Y_TIMEOUT_S)
